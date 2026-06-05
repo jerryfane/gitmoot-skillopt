@@ -903,7 +903,7 @@ def test_landing_page_judge_prompt_includes_render_and_feedback_context(monkeypa
         {"mode": "landing_page_v1", "artifact_contract": "vue_vite_bundle", "require_vue_render_smoke": True},
     )
 
-    assert score["hard"] == 0
+    assert score["hard"] == 1
     assert score["soft"] == 0.75
     assert score["contract_status"] == "passed"
     assert score["quality_status"] == "failed"
@@ -962,9 +962,11 @@ def test_landing_page_judge_is_inferred_for_legacy_vue_feedback_package(monkeypa
     )
 
     assert captured["stage"] == "gitmoot_landing_page_judge"
-    assert score["hard"] == 0
+    assert score["hard"] == 1
     assert score["soft"] == 0.75
     assert score["fail_reason"] == "human feedback requested continued optimization; candidate is not ready to stop"
+    assert score["contract_status"] == "passed"
+    assert score["quality_status"] == "failed"
     assert score["human_feedback_alignment"]["required_improvements"] == ["more motion", "better product graphics"]
     assert score["failure"]["primary_reason"] == "human_feedback_not_resolved"
     assert "motion" in score["failure"]["optimizer_hint"]
@@ -1242,6 +1244,104 @@ def test_generic_judge_with_resolved_feedback_does_not_emit_failure_hint(monkeyp
     assert "B is ready" in captured["user"]
 
 
+def test_generic_judge_with_feedback_keeps_incomplete_answer_hard_failed(monkeypatch):
+    def fake_chat_optimizer(**kwargs):
+        return (
+            json.dumps(
+                {
+                    "hard": 0,
+                    "soft": 0.55,
+                    "reasoning": "The response is valid but incomplete.",
+                    "fail_reason": "answer_incomplete",
+                    "human_feedback_alignment": {"status": "resolved"},
+                    "dimension_scores": {
+                        "human_feedback_resolution": 0.9,
+                        "artifact_validity": 1.0,
+                        "task_completeness": 0.4,
+                    },
+                    "unresolved_feedback": [],
+                    "rejection_reason": "answer_incomplete",
+                    "optimizer_hint": "Complete the requested answer before retrying.",
+                }
+            ),
+            {},
+        )
+
+    monkeypatch.setattr("skillopt.envs.gitmoot.evaluator.chat_optimizer", fake_chat_optimizer)
+
+    score = evaluate_response(
+        {
+            "id": "generic-incomplete",
+            "prompt": "Write an X post.",
+            "ranked_feedback_events": [
+                {
+                    "ranking": ["B", "A"],
+                    "reasoning": "B is ready if complete.",
+                    "quality": "strong",
+                    "continue_mode": "validate",
+                    "promote": "yes",
+                }
+            ],
+        },
+        "A partial post.",
+        {},
+    )
+
+    assert score["hard"] == 0
+    assert score["soft"] == 0.55
+    assert score["quality_status"] == "failed"
+    assert score["primary_reason"] == "answer_incomplete"
+
+
+def test_generic_judge_with_feedback_preserves_explicit_hard_failure(monkeypatch):
+    def fake_chat_optimizer(**kwargs):
+        return (
+            json.dumps(
+                {
+                    "hard": 0,
+                    "soft": 0.7,
+                    "reasoning": "The response is not a valid final answer.",
+                    "fail_reason": "invalid_final_answer",
+                    "human_feedback_alignment": {"status": "resolved"},
+                    "dimension_scores": {
+                        "human_feedback_resolution": 0.9,
+                        "artifact_validity": 0.9,
+                        "task_completeness": 0.9,
+                    },
+                    "unresolved_feedback": [],
+                    "rejection_reason": "invalid_final_answer",
+                    "optimizer_hint": "Return a valid final answer.",
+                }
+            ),
+            {},
+        )
+
+    monkeypatch.setattr("skillopt.envs.gitmoot.evaluator.chat_optimizer", fake_chat_optimizer)
+
+    score = evaluate_response(
+        {
+            "id": "generic-explicit-hard-fail",
+            "prompt": "Write an X post.",
+            "ranked_feedback_events": [
+                {
+                    "ranking": ["B", "A"],
+                    "reasoning": "B resolved the feedback.",
+                    "quality": "strong",
+                    "continue_mode": "validate",
+                    "promote": "yes",
+                }
+            ],
+        },
+        "Invalid final answer.",
+        {},
+    )
+
+    assert score["hard"] == 0
+    assert score["soft"] == 0.7
+    assert score["quality_status"] == "failed"
+    assert score["primary_reason"] == "invalid_final_answer"
+
+
 def test_generic_judge_uses_top_level_feedback_context(monkeypatch):
     captured = {}
 
@@ -1409,7 +1509,7 @@ def test_generic_judge_rejects_inconsistent_resolved_feedback(monkeypatch):
         {},
     )
 
-    assert score["hard"] == 0
+    assert score["hard"] == 1
     assert score["soft"] == 0.75
     assert score["quality_status"] == "failed"
     assert score["primary_reason"] == "visuals_unresolved"
@@ -1463,7 +1563,7 @@ def test_generic_judge_preserves_alignment_only_unresolved_feedback(monkeypatch)
         {},
     )
 
-    assert score["hard"] == 0
+    assert score["hard"] == 1
     assert score["quality_status"] == "failed"
     assert score["primary_reason"] == "human_feedback_not_resolved"
     assert score["evidence"] == ["scroll animation", "product graphics"]
@@ -1555,6 +1655,39 @@ def test_landing_page_evaluator_accepts_numeric_string_hard(tmp_path, monkeypatc
     assert result["soft"] == 0.82
     assert result["score_status"] == "scored"
     assert result["evaluator_status"] == "passed"
+
+
+def test_landing_page_judge_hard_failure_is_not_overwritten_by_contract_pass(monkeypatch):
+    def fake_chat_optimizer(**kwargs):
+        return (
+            json.dumps(
+                {
+                    "hard": 0,
+                    "soft": 0.52,
+                    "dimension_scores": _landing_dimension_scores(),
+                    "rationale": "The bundle is valid, but the judged page is incomplete.",
+                    "fail_reason": "page is incomplete",
+                }
+            ),
+            {},
+        )
+
+    monkeypatch.setattr("skillopt.envs.gitmoot.evaluator.chat_optimizer", fake_chat_optimizer)
+
+    score = evaluate_response(
+        {
+            "id": "landing-page-judge-hard-fail",
+            "prompt": "Build a Vue/Vite landing page preview.",
+            "metadata": {"output_type": "vue_vite_bundle"},
+        },
+        _valid_vue_bundle_response(),
+        {"mode": "landing_page_v1", "artifact_contract": "vue_vite_bundle"},
+    )
+
+    assert score["contract_status"] == "passed"
+    assert score["hard"] == 0
+    assert score["quality_status"] == "failed"
+    assert score["fail_reason"] == "page is incomplete"
 
 
 def test_landing_page_judge_rejection_returns_optimizer_failure_packet(monkeypatch):
@@ -2470,7 +2603,7 @@ def test_landing_page_evaluator_optional_render_smoke_failure_reaches_judge(monk
 
     assert called is True
     assert score["hard"] == 1
-    assert score["contract_status"] == "failed"
+    assert score["contract_status"] == "passed"
     assert score["quality_status"] == "passed"
     assert score["metadata"]["dimension_scores"]["render_smoke"] == 0.0
     assert score["metadata"]["render_smoke"]["failure"]["failed_checks"][0]["check"] == "vue_render_smoke.horizontal_overflow"
