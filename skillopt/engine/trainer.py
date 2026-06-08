@@ -1555,13 +1555,20 @@ def _selection_sample_artifact_path(eval_dir: str) -> str:
     """Return the first persisted target artifact from a selection rollout."""
     if not eval_dir:
         return ""
-    candidates: list[str] = []
+    exec_artifacts: list[str] = []
+    exec_responses: list[str] = []
+    legacy_responses: list[str] = []
     for root, _dirs, files in os.walk(eval_dir):
         if "target_exec_artifact.json" in files:
-            candidates.append(os.path.join(root, "target_exec_artifact.json"))
+            exec_artifacts.append(os.path.join(root, "target_exec_artifact.json"))
+        if "target_exec_response.txt" in files:
+            exec_responses.append(os.path.join(root, "target_exec_response.txt"))
         if "target_response.txt" in files:
-            candidates.append(os.path.join(root, "target_response.txt"))
-    return sorted(candidates)[0] if candidates else ""
+            legacy_responses.append(os.path.join(root, "target_response.txt"))
+    for candidates in (exec_artifacts, exec_responses, legacy_responses):
+        if candidates:
+            return sorted(candidates)[0]
+    return ""
 
 
 def _extract_dimension_scores(result: dict | None) -> dict[str, float]:

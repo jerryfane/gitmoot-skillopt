@@ -17,12 +17,33 @@ from skillopt.engine.trainer import (
     _ranked_feedback_context_packet,
     _ranked_feedback_item_ids,
     _selection_eval_context,
+    _selection_sample_artifact_path,
     _selection_reject_gate_rejection,
     _selection_rejection_signal,
     _should_skip_final_test_after_selection_reject,
 )
 from skillopt.evaluation.gate import evaluate_gate, find_gate_block
 from tests.test_gitmoot_dataloader import write_training_package
+
+
+def test_selection_sample_artifact_path_prefers_exec_artifact_then_exec_response(tmp_path):
+    eval_dir = tmp_path / "selection_eval"
+    pred_dir = eval_dir / "predictions" / "item-001"
+    pred_dir.mkdir(parents=True)
+    exec_response = pred_dir / "target_exec_response.txt"
+    exec_response.write_text("text reply", encoding="utf-8")
+
+    assert _selection_sample_artifact_path(str(eval_dir)) == str(exec_response)
+
+    legacy_response = pred_dir / "target_response.txt"
+    legacy_response.write_text("legacy reply", encoding="utf-8")
+    assert _selection_sample_artifact_path(str(eval_dir)) == str(exec_response)
+
+    later_pred_dir = eval_dir / "predictions" / "item-002"
+    later_pred_dir.mkdir(parents=True)
+    exec_artifact = later_pred_dir / "target_exec_artifact.json"
+    exec_artifact.write_text('{"renderer":"vue-vite"}', encoding="utf-8")
+    assert _selection_sample_artifact_path(str(eval_dir)) == str(exec_artifact)
 
 
 def test_gate_blocks_unscored_selection_result_with_trace_paths():

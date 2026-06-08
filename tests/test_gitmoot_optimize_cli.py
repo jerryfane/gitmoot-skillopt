@@ -1652,6 +1652,46 @@ def test_candidate_package_attaches_best_selection_sample_artifact(tmp_path):
     assert loaded.summary.metadata["artifact_ids"][-1].endswith("/candidate-selection-sample")
 
 
+def test_candidate_package_attaches_text_selection_sample_artifact(tmp_path):
+    package_path, artifact_root = write_training_package(tmp_path)
+    del artifact_root
+    package = TrainingPackage.load(package_path)
+    candidate_output = tmp_path / "out" / "candidate.json"
+    sample_path = tmp_path / "sample" / "target_exec_response.txt"
+    sample_path.parent.mkdir(parents=True)
+    sample_path.write_text('{"reply":"a single session shouldnt spend like a team"}', encoding="utf-8")
+
+    candidate = write_candidate_package(
+        package=package,
+        candidate_content=package.template.content + "\nImprove voice.\n",
+        summary={
+            "gate_status": "passed",
+            "promotable": True,
+            "best_origin": "step_0001",
+            "best_selection_hard": 1,
+            "baseline_selection_hard": 1,
+            "best_selection_sample_artifact_path": str(sample_path),
+            "config": {"eval_test": False},
+        },
+        out_root=tmp_path / "out",
+        artifact_dir=tmp_path / "out" / "artifacts",
+        candidate_output=candidate_output,
+        dry_run=False,
+    )
+
+    loaded = CandidatePackage.load(candidate_output)
+    sample_artifacts = [artifact for artifact in candidate.artifacts if artifact.id.endswith("/candidate-selection-sample")]
+
+    assert len(sample_artifacts) == 1
+    assert sample_artifacts[0].media_type == "text/plain"
+    assert sample_artifacts[0].driver == "text"
+    written_sample = tmp_path / "out" / "artifacts" / sample_artifacts[0].path
+    assert written_sample.is_file()
+    assert written_sample.read_text(encoding="utf-8") == '{"reply":"a single session shouldnt spend like a team"}'
+    assert loaded.eval_report["best_selection_sample_artifact_path"] == str(sample_path)
+    assert loaded.summary.metadata["artifact_ids"][-1].endswith("/candidate-selection-sample")
+
+
 def test_initial_skill_best_origin_writes_no_candidate_metadata(tmp_path):
     package_path, artifact_root = write_training_package(tmp_path)
     del artifact_root
