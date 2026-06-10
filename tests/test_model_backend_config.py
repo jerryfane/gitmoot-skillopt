@@ -68,3 +68,81 @@ def test_codex_target_exec_receives_file_edit_mode(monkeypatch, tmp_path):
     assert response == "done"
     assert raw.startswith("===== CODEX")
     assert calls["allow_file_edits"] is True
+
+
+def test_optimize_cli_model_defaults_are_empty_for_backend_resolution():
+    # A hardcoded gpt-5.5 default overrode the per-backend model defaults, so
+    # the claude backend was asked for an OpenAI model (404 at preflight).
+    from gitmoot_skillopt.cli import build_parser
+
+    args = build_parser().parse_args(
+        [
+            "optimize",
+            "--training-package", "pkg.json",
+            "--artifact-root", "blobs",
+            "--out-root", "out",
+            "--candidate-output", "out/candidate.json",
+        ]
+    )
+    assert args.optimizer_model == ""
+    assert args.target_model == ""
+
+
+def test_default_model_for_backend_claude():
+    from skillopt.model.common import default_model_for_backend
+
+    assert default_model_for_backend("claude").startswith("claude-")
+    assert not default_model_for_backend("codex").startswith("claude-")
+
+
+def test_claude_cli_error_includes_stdout_tail(monkeypatch):
+    import subprocess as subprocess_module
+    from types import SimpleNamespace
+
+    import pytest
+
+    from skillopt.model import claude_backend as cb
+
+    def fake_run(cmd, **kwargs):
+        return SimpleNamespace(
+            returncode=1,
+            stdout='{"type":"result","is_error":true,"result":"model not available"}',
+            stderr="",
+        )
+
+    monkeypatch.setattr(cb.subprocess, "run", fake_run)
+    # A recognizable stdout error is classified into actionable guidance even
+    # though stderr is empty (JSON-mode failures land on stdout).
+    with pytest.raises(RuntimeError) as excinfo:
+        cb._run_claude_print(
+            system="s",
+            prompt="p",
+            model="claude-sonnet-4-6",
+            tools=None,
+            tool_choice=None,
+            return_message=False,
+            timeout=5,
+        )
+    assert "rejected it" in str(excinfo.value)
+
+    # An unrecognized stdout error surfaces its tail instead of a bare exit code.
+    def fake_run_unclassified(cmd, **kwargs):
+        return SimpleNamespace(
+            returncode=1,
+            stdout='{"type":"result","is_error":true,"result":"something exploded"}',
+            stderr="",
+        )
+
+    monkeypatch.setattr(cb.subprocess, "run", fake_run_unclassified)
+    with pytest.raises(RuntimeError) as excinfo:
+        cb._run_claude_print(
+            system="s",
+            prompt="p",
+            model="claude-sonnet-4-6",
+            tools=None,
+            tool_choice=None,
+            return_message=False,
+            timeout=5,
+        )
+    assert "something exploded" in str(excinfo.value)
+    assert "exited with code 1" in str(excinfo.value)

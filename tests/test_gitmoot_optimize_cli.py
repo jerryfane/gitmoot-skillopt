@@ -1894,3 +1894,104 @@ def test_selection_reject_summary_writes_gate_rejection_package(tmp_path):
         "valid artifact",
         "complete footer",
     ]
+
+
+def test_candidate_package_prepends_frontmatter_for_frontmatterless_content(tmp_path):
+    package_path, _artifact_root = write_training_package(tmp_path)
+    package = TrainingPackage.load(package_path)
+    out_root = tmp_path / "out"
+
+    candidate = write_candidate_package(
+        package=package,
+        candidate_content="# Optimized Skill\n\nDo the work better.",
+        summary={"best_origin": "step_0001", "total_accepts": 1},
+        out_root=out_root,
+        artifact_dir=out_root / "artifacts",
+        candidate_output=out_root / "candidate.json",
+        dry_run=False,
+    )
+
+    # validate() ran inside write_candidate_package; the content now starts
+    # with frontmatter matching the package metadata exactly.
+    assert candidate.candidate.content.startswith("---\n")
+    assert "# Optimized Skill" in candidate.candidate.content
+    candidate.validate()
+
+
+def test_candidate_package_keeps_existing_frontmatter_untouched(tmp_path):
+    package_path, _artifact_root = write_training_package(tmp_path)
+    package = TrainingPackage.load(package_path)
+    out_root = tmp_path / "out"
+
+    candidate = write_candidate_package(
+        package=package,
+        candidate_content=package.template.content,
+        summary={"best_origin": "initial_skill", "total_accepts": 0},
+        out_root=out_root,
+        artifact_dir=out_root / "artifacts",
+        candidate_output=out_root / "candidate.json",
+        dry_run=False,
+    )
+
+    assert candidate.candidate.content == package.template.content
+
+
+def test_frontmatterless_template_dry_run_prepends_and_noop_still_detected(tmp_path):
+    # Legacy templates exported by gitmoot can carry content WITHOUT
+    # frontmatter (metadata synthesized separately): the dry-run candidate is
+    # the template content itself, must get frontmatter prepended, and the
+    # raw-content no-op detection must still fire.
+    package_path, _artifact_root = write_training_package(tmp_path)
+    data = json.loads(package_path.read_text(encoding="utf-8"))
+    from gitmoot_skillopt.artifacts import content_hash as hash_content
+    from gitmoot_skillopt.contracts import _split_frontmatter
+
+    _, body = _split_frontmatter(data["template"]["content"])
+    data["template"]["content"] = body
+    data["template"]["content_hash"] = hash_content(body.encode())
+    stripped_path = tmp_path / "package-frontmatterless.json"
+    stripped_path.write_text(json.dumps(data), encoding="utf-8")
+    package = TrainingPackage.load(stripped_path)
+    assert not package.template.content.lstrip().startswith("---")
+
+    out_root = tmp_path / "out-fm"
+    candidate = write_candidate_package(
+        package=package,
+        candidate_content=package.template.content,
+        summary={"best_origin": "initial_skill", "total_accepts": 0},
+        out_root=out_root,
+        artifact_dir=out_root / "artifacts",
+        candidate_output=out_root / "candidate.json",
+        dry_run=True,
+    )
+
+    # Packaged content gained frontmatter and validates...
+    assert candidate.candidate.content.startswith("---\n")
+    candidate.validate()
+    # ...while the unchanged RAW content still registers as a no-op.
+    assert "candidate_content_unchanged" in (candidate.eval_report.get("no_candidate_triggers") or [])
+
+
+def test_preflight_resolves_empty_model_to_backend_default(tmp_path, monkeypatch):
+    from gitmoot_skillopt import preflight
+    from skillopt.model.common import default_model_for_backend
+
+    for canary in (
+        "_run_optimizer_canary",
+        "_run_target_canary",
+        "_run_evaluator_canary",
+        "_run_required_render_smoke_canary",
+    ):
+        monkeypatch.setattr(preflight, canary, lambda *args, **kwargs: None)
+
+    package_path, _artifact_root = write_training_package(tmp_path)
+    package = TrainingPackage.load(package_path)
+    result = preflight.run_optimizer_preflight(
+        package,
+        optimizer_backend="claude",
+        target_backend="claude",
+        optimizer_model="",
+        target_model="",
+    )
+    assert result.optimizer_model == default_model_for_backend("claude")
+    assert result.target_model == default_model_for_backend("claude")

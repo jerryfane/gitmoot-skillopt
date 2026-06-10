@@ -261,8 +261,13 @@ def _run_claude_print(*, system: str, prompt: str, model: str, tools: list[dict[
         proc = subprocess.run(cmd + [prompt_for_cli], capture_output=True, text=True, timeout=timeout or 300, cwd=temp_dir)
         stderr_text = (proc.stderr or "").strip()
         if proc.returncode != 0:
-            _check_claude_error(stderr_text, model)
-            raise RuntimeError(stderr_text or f"Claude CLI exited with code {proc.returncode}")
+            stdout_tail = (proc.stdout or "").strip()[-2000:]
+            # JSON-mode failures land on stdout with empty stderr; classify
+            # against whichever stream carries the message so the actionable
+            # guidance (bad model / auth) still fires.
+            _check_claude_error(stderr_text or stdout_tail, model)
+            detail = stderr_text or stdout_tail or "no output"
+            raise RuntimeError(f"Claude CLI exited with code {proc.returncode}: {detail}")
         stream = []
         for raw_line in (proc.stdout or "").splitlines():
             raw_line = raw_line.strip()
