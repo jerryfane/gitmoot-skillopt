@@ -7,8 +7,12 @@ import json
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 from gitmoot_skillopt.artifacts import OutputArtifactWriter, content_hash
 from gitmoot_skillopt.contracts import (
+    ContractError,
+    _split_frontmatter,
     CANDIDATE_PACKAGE_KIND,
     CONTRACT_VERSION,
     CandidatePackage,
@@ -36,8 +40,8 @@ def run_optimize(
     optimizer_views: int = 1,
     retry_optimizer_views: str | int = "auto",
     seed: int = 42,
-    optimizer_model: str = "gpt-5.5",
-    target_model: str = "gpt-5.5",
+    optimizer_model: str = "",
+    target_model: str = "",
     optimizer_backend: str = "openai_chat",
     target_backend: str = "openai_chat",
     evaluator_id: str = "",
@@ -339,6 +343,12 @@ def write_candidate_package(
     dry_run: bool,
 ) -> CandidatePackage:
     writer = OutputArtifactWriter(out_root, artifact_dir)
+    # Legacy templates can lack frontmatter, in which case the optimizer's
+    # rewrite lacks it too; the packaged candidate must carry the frontmatter
+    # serialized from the SAME metadata dict validate() compares against. The
+    # diff and no-op detection keep using the raw content so an unchanged
+    # rewrite still counts as a no-op.
+    packaged_content = _ensure_candidate_frontmatter(candidate_content, package.template.metadata)
     diff_text = _diff_text(package.template.content, candidate_content)
     no_candidate_triggers = _no_candidate_triggers(summary, package.template.content, candidate_content)
     eval_report = _eval_report(summary, dry_run=dry_run, no_candidate_triggers=no_candidate_triggers)
@@ -378,7 +388,7 @@ def write_candidate_package(
         template_id=package.template.id,
         base_version_id=package.template.version_id,
         candidate=CandidateTemplate(
-            content=candidate_content,
+            content=packaged_content,
             metadata=package.template.metadata,
         ),
         artifacts=artifacts,
@@ -395,6 +405,35 @@ def write_candidate_package(
     candidate_output.parent.mkdir(parents=True, exist_ok=True)
     candidate.dump(candidate_output)
     return candidate
+
+
+def _ensure_candidate_frontmatter(content: str, metadata: dict[str, Any]) -> str:
+    """Prepend the template metadata as YAML frontmatter when content has none.
+
+    The validator's own splitter is the oracle: content it can split already
+    carries frontmatter and is returned untouched (so a candidate with
+    mismatched frontmatter still fails validation instead of being silently
+    rewritten), while content that merely starts with dashes (a horizontal
+    rule, an unclosed ---) gets the frontmatter prepended like any other.
+    """
+    try:
+        _split_frontmatter(content)
+        return content
+    except Exception:  # noqa: BLE001 - any split failure means "no frontmatter"
+        pass
+    normalized = content.replace("\r\n", "\n")
+    body = normalized.lstrip("\n")
+    for dump_kwargs in ({"sort_keys": False, "allow_unicode": True}, {"sort_keys": False, "allow_unicode": True, "default_style": '"'}):
+        frontmatter = yaml.safe_dump(dict(metadata), **dump_kwargs).strip()
+        candidate = "---\n" + frontmatter + "\n---\n\n" + body
+        try:
+            # A metadata string containing a bare "---" line would corrupt the
+            # block-style dump; re-dump fully quoted before giving up.
+            _split_frontmatter(candidate)
+            return candidate
+        except Exception:  # noqa: BLE001
+            continue
+    raise ContractError("could not serialize template metadata as YAML frontmatter for the candidate")
 
 
 def _candidate_artifact_id(package: TrainingPackage, suffix: str) -> str:

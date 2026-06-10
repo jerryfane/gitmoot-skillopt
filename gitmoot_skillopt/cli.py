@@ -81,8 +81,8 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     optimize.add_argument("--seed", type=int, default=42, help="random seed")
-    optimize.add_argument("--optimizer-model", default="gpt-5.5", help="optimizer model name")
-    optimize.add_argument("--target-model", default="gpt-5.5", help="target model name")
+    optimize.add_argument("--optimizer-model", default="", help="optimizer model name (empty = backend default)")
+    optimize.add_argument("--target-model", default="", help="target model name (empty = backend default)")
     optimize.add_argument("--optimizer-backend", default="openai_chat", help="optimizer backend")
     optimize.add_argument(
         "--target-backend",
