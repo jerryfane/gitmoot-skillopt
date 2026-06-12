@@ -12,7 +12,13 @@ import time
 from typing import Any
 from urllib.parse import unquote, urlparse
 
-from skillopt.model.common import CompatAssistantMessage, CompatToolCall, CompatToolFunction, default_model_for_backend, tracker
+from skillopt.model.common import (
+    CompatAssistantMessage,
+    CompatToolCall,
+    CompatToolFunction,
+    default_model_for_backend,
+    tracker,
+)
 
 CLAUDE_BIN = os.environ.get("CLAUDE_CLI_BIN", "claude")
 CLAUDE_PERMISSION_MODE = os.environ.get("CLAUDE_PERMISSION_MODE", "dontAsk")
@@ -23,6 +29,8 @@ OPTIMIZER_DEPLOYMENT = os.environ.get("OPTIMIZER_DEPLOYMENT", "claude-sonnet-4-6
 TARGET_DEPLOYMENT = os.environ.get("TARGET_DEPLOYMENT", "claude-sonnet-4-6")
 REASONING_EFFORT: str | None = None
 _VALID_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
+_CLAUDE_SCHEMA_HELP_TIMEOUT_SECONDS = 5
+_CLAUDE_STRUCTURED_SCHEMA_FLAG_CACHE: dict[str, str] = {}
 
 
 def _parse_data_uri(url: str) -> tuple[bytes, str]:
@@ -205,6 +213,58 @@ def _check_claude_error(stderr_text: str, model: str) -> None:
         raise RuntimeError(f"Claude backend tried to use model {model!r}, but your current Claude CLI/account rejected it. Try an available Claude model such as {default_model!r}.")
 
 
+def _claude_help_text(bin_path: str) -> str:
+    try:
+        proc = subprocess.run(
+            [bin_path, "--help"],
+            capture_output=True,
+            text=True,
+            timeout=_CLAUDE_SCHEMA_HELP_TIMEOUT_SECONDS,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"Claude CLI executable {bin_path!r} was not found. Install Claude Code or set CLAUDE_CLI_BIN to a valid executable.") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"Claude CLI executable {bin_path!r} did not return --help within {_CLAUDE_SCHEMA_HELP_TIMEOUT_SECONDS}s. Check the Claude Code install before running the optimizer.") from exc
+    except OSError as exc:
+        raise RuntimeError(f"Could not inspect Claude CLI executable {bin_path!r}: {exc}") from exc
+
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip() or "no output"
+        raise RuntimeError(f"Claude CLI executable {bin_path!r} failed while probing --help for structured output support: {detail}")
+    return f"{proc.stdout or ''}\n{proc.stderr or ''}"
+
+
+def _claude_structured_schema_flag() -> str:
+    cached = _CLAUDE_STRUCTURED_SCHEMA_FLAG_CACHE.get(CLAUDE_BIN)
+    if cached:
+        return cached
+
+    help_text = _claude_help_text(CLAUDE_BIN)
+    if "--json-schema" in help_text:
+        flag = "--json-schema"
+    elif "--schema" in help_text:
+        flag = "--schema"
+    else:
+        raise RuntimeError(
+            f"Claude CLI executable {CLAUDE_BIN!r} does not expose a structured-output schema flag. "
+            "Update Claude Code to a version with `--json-schema`, or choose another SkillOpt backend."
+        )
+
+    _CLAUDE_STRUCTURED_SCHEMA_FLAG_CACHE[CLAUDE_BIN] = flag
+    return flag
+
+
+def _claude_structured_schema_args(schema_json: str) -> list[str]:
+    return [_claude_structured_schema_flag(), schema_json]
+
+
+def _is_schema_flag_rejection(detail: str, flag: str) -> bool:
+    lowered = detail.lower()
+    if flag not in detail:
+        return False
+    return any(marker in lowered for marker in ("unknown option", "unrecognized option", "unknown argument", "unexpected argument", "invalid option"))
+
+
 def _normalize_reasoning_effort(effort: str | None) -> str | None:
     normalized = str(effort or "").strip().lower()
     if not normalized or normalized == "off":
@@ -256,8 +316,11 @@ def _run_claude_print(*, system: str, prompt: str, model: str, tools: list[dict[
         if effort:
             cmd.extend(["--effort", effort])
         structured_output = bool(return_message)
+        structured_schema_flag = ""
         if structured_output:
-            cmd.extend(["--schema", _assistant_message_schema_wrapper()])
+            schema_args = _claude_structured_schema_args(_assistant_message_schema_wrapper())
+            structured_schema_flag = schema_args[0]
+            cmd.extend(schema_args)
         proc = subprocess.run(cmd + [prompt_for_cli], capture_output=True, text=True, timeout=timeout or 300, cwd=temp_dir)
         stderr_text = (proc.stderr or "").strip()
         if proc.returncode != 0:
@@ -265,8 +328,14 @@ def _run_claude_print(*, system: str, prompt: str, model: str, tools: list[dict[
             # JSON-mode failures land on stdout with empty stderr; classify
             # against whichever stream carries the message so the actionable
             # guidance (bad model / auth) still fires.
-            _check_claude_error(stderr_text or stdout_tail, model)
             detail = stderr_text or stdout_tail or "no output"
+            if structured_schema_flag and _is_schema_flag_rejection(detail, structured_schema_flag):
+                raise RuntimeError(
+                    f"Claude CLI executable {CLAUDE_BIN!r} rejected structured output flag {structured_schema_flag!r}. "
+                    "Update Claude Code to a version with `--json-schema`, or choose another SkillOpt backend. "
+                    f"Raw error: {detail}"
+                )
+            _check_claude_error(stderr_text or stdout_tail, model)
             raise RuntimeError(f"Claude CLI exited with code {proc.returncode}: {detail}")
         stream = []
         for raw_line in (proc.stdout or "").splitlines():

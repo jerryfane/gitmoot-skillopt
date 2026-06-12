@@ -96,7 +96,6 @@ def test_default_model_for_backend_claude():
 
 
 def test_claude_cli_error_includes_stdout_tail(monkeypatch):
-    import subprocess as subprocess_module
     from types import SimpleNamespace
 
     import pytest
@@ -146,3 +145,219 @@ def test_claude_cli_error_includes_stdout_tail(monkeypatch):
         )
     assert "something exploded" in str(excinfo.value)
     assert "exited with code 1" in str(excinfo.value)
+
+
+def test_claude_structured_output_uses_json_schema_flag(monkeypatch):
+    import json
+    from types import SimpleNamespace
+
+    from skillopt.model import claude_backend as cb
+
+    calls = []
+    cb._CLAUDE_STRUCTURED_SCHEMA_FLAG_CACHE.clear()
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd == [cb.CLAUDE_BIN, "--help"]:
+            return SimpleNamespace(returncode=0, stdout="Usage:\n  --json-schema <schema>\n", stderr="")
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({
+                "type": "result",
+                "result": {"content": "ok", "tool_calls": []},
+                "usage": {"input_tokens": 2, "output_tokens": 3},
+            }),
+            stderr="",
+        )
+
+    monkeypatch.setattr(cb.subprocess, "run", fake_run)
+
+    _, payload, usage = cb._run_claude_print(
+        system="s",
+        prompt="p",
+        model="claude-sonnet-4-6",
+        tools=None,
+        tool_choice=None,
+        return_message=True,
+        timeout=5,
+    )
+
+    command = calls[-1]
+    assert "--json-schema" in command
+    assert "--schema" not in command
+    assert payload["result"]["content"] == "ok"
+    assert usage["total_tokens"] == 5
+
+
+def test_claude_structured_output_falls_back_to_legacy_schema_flag(monkeypatch):
+    import json
+    from types import SimpleNamespace
+
+    from skillopt.model import claude_backend as cb
+
+    calls = []
+    cb._CLAUDE_STRUCTURED_SCHEMA_FLAG_CACHE.clear()
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd == [cb.CLAUDE_BIN, "--help"]:
+            return SimpleNamespace(returncode=0, stdout="Usage:\n  --schema <schema>\n", stderr="")
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({
+                "type": "result",
+                "result": {"content": "ok", "tool_calls": []},
+                "usage": {},
+            }),
+            stderr="",
+        )
+
+    monkeypatch.setattr(cb.subprocess, "run", fake_run)
+
+    cb._run_claude_print(
+        system="s",
+        prompt="p",
+        model="claude-sonnet-4-6",
+        tools=None,
+        tool_choice=None,
+        return_message=True,
+        timeout=5,
+    )
+
+    assert "--schema" in calls[-1]
+
+
+def test_claude_structured_output_missing_schema_flag_fails_before_model_call(monkeypatch):
+    from types import SimpleNamespace
+
+    import pytest
+
+    from skillopt.model import claude_backend as cb
+
+    cb._CLAUDE_STRUCTURED_SCHEMA_FLAG_CACHE.clear()
+
+    def fake_run(cmd, **kwargs):
+        if cmd == [cb.CLAUDE_BIN, "--help"]:
+            return SimpleNamespace(returncode=0, stdout="Usage:\n  --output-format <format>\n", stderr="")
+        raise AssertionError("model call should not start when schema flag is unsupported")
+
+    monkeypatch.setattr(cb.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        cb._run_claude_print(
+            system="s",
+            prompt="p",
+            model="claude-sonnet-4-6",
+            tools=None,
+            tool_choice=None,
+            return_message=True,
+            timeout=5,
+        )
+
+    assert "does not expose a structured-output schema flag" in str(excinfo.value)
+
+
+def test_claude_structured_output_help_timeout_fails_before_model_call(monkeypatch):
+    import subprocess as subprocess_module
+
+    import pytest
+
+    from skillopt.model import claude_backend as cb
+
+    cb._CLAUDE_STRUCTURED_SCHEMA_FLAG_CACHE.clear()
+
+    def fake_run(cmd, **kwargs):
+        if cmd == [cb.CLAUDE_BIN, "--help"]:
+            raise subprocess_module.TimeoutExpired(cmd, timeout=5)
+        raise AssertionError("model call should not start when help probing times out")
+
+    monkeypatch.setattr(cb.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        cb._run_claude_print(
+            system="s",
+            prompt="p",
+            model="claude-sonnet-4-6",
+            tools=None,
+            tool_choice=None,
+            return_message=True,
+            timeout=5,
+        )
+
+    assert "did not return --help" in str(excinfo.value)
+
+
+def test_claude_structured_output_rejected_flag_has_actionable_error(monkeypatch):
+    from types import SimpleNamespace
+
+    import pytest
+
+    from skillopt.model import claude_backend as cb
+
+    cb._CLAUDE_STRUCTURED_SCHEMA_FLAG_CACHE.clear()
+
+    def fake_run(cmd, **kwargs):
+        if cmd == [cb.CLAUDE_BIN, "--help"]:
+            return SimpleNamespace(returncode=0, stdout="Usage:\n  --json-schema <schema>\n", stderr="")
+        return SimpleNamespace(
+            returncode=1,
+            stdout="",
+            stderr="error: unknown option '--json-schema'",
+        )
+
+    monkeypatch.setattr(cb.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        cb._run_claude_print(
+            system="s",
+            prompt="p",
+            model="claude-sonnet-4-6",
+            tools=None,
+            tool_choice=None,
+            return_message=True,
+            timeout=5,
+        )
+
+    message = str(excinfo.value)
+    assert "rejected structured output flag" in message
+    assert "Update Claude Code" in message
+
+
+def test_claude_plain_output_does_not_probe_schema_flags(monkeypatch):
+    import json
+    from types import SimpleNamespace
+
+    from skillopt.model import claude_backend as cb
+
+    calls = []
+    cb._CLAUDE_STRUCTURED_SCHEMA_FLAG_CACHE.clear()
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd == [cb.CLAUDE_BIN, "--help"]:
+            raise AssertionError("plain output should not probe schema flag support")
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({
+                "type": "result",
+                "result": "plain ok",
+                "usage": {},
+            }),
+            stderr="",
+        )
+
+    monkeypatch.setattr(cb.subprocess, "run", fake_run)
+
+    raw_text, _, _ = cb._run_claude_print(
+        system="s",
+        prompt="p",
+        model="claude-sonnet-4-6",
+        tools=None,
+        tool_choice=None,
+        return_message=False,
+        timeout=5,
+    )
+
+    assert raw_text == "plain ok"
+    assert "--json-schema" not in calls[-1]
+    assert "--schema" not in calls[-1]
