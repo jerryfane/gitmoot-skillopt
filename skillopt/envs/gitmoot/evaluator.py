@@ -978,13 +978,86 @@ def _judge_schema_retry_reason(parsed: Any, item: dict[str, Any] | None = None) 
     return "judge returned invalid human-feedback scoring schema"
 
 
+def _judge_task_kind(item: dict[str, Any], config: dict[str, Any]) -> str:
+    """Resolve the task_kind used to select a per-kind judge prompt variant.
+
+    Prefer item metadata (where the gitmoot Go side stamps it), then fall back
+    to the top-level item and the evaluator config. Returns "" when absent.
+    """
+    metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+    for source in (metadata, item, config):
+        if not isinstance(source, dict):
+            continue
+        task_kind = str(source.get("task_kind") or "").strip()
+        if task_kind:
+            return task_kind
+    return ""
+
+
+def _judge_prompt_templates(config: dict[str, Any]) -> dict[str, Any]:
+    """Collect judge_prompt_templates from every supported config location.
+
+    The gitmoot Go side carries the variants at
+    ``evaluator_profile.judge.config.judge_prompt_templates`` and also under the
+    raw ``evaluator_config``; once merged they may surface at the top level, the
+    nested ``judge.config``, or an ``evaluation`` block. Earlier (more specific)
+    sources win on key collisions. Defensive: non-mapping inputs are skipped.
+    """
+    if not isinstance(config, dict):
+        return {}
+    merged: dict[str, Any] = {}
+    for templates in _judge_prompt_template_sources(config):
+        if not isinstance(templates, dict):
+            continue
+        for key, value in templates.items():
+            merged.setdefault(key, value)
+    return merged
+
+
+def _judge_prompt_template_sources(config: dict[str, Any]) -> list[Any]:
+    sources: list[Any] = [config.get("judge_prompt_templates")]
+    judge = config.get("judge")
+    if isinstance(judge, dict):
+        sources.append(judge.get("judge_prompt_templates"))
+        judge_config = judge.get("config")
+        if isinstance(judge_config, dict):
+            sources.append(judge_config.get("judge_prompt_templates"))
+    evaluation = config.get("evaluation")
+    if isinstance(evaluation, dict):
+        sources.append(evaluation.get("judge_prompt_templates"))
+    return sources
+
+
+def _resolve_judge_system_prompt(item: dict[str, Any], config: dict[str, Any], default_fn) -> str:
+    """Return a configured per-task_kind judge system prompt, else the default.
+
+    Looks up ``judge_prompt_templates[task_kind]`` across the supported config
+    locations and uses it when present and a non-empty string. Any missing,
+    None, or wrong-typed config falls back to ``default_fn()`` so behavior is
+    byte-identical to today when no variant is configured.
+    """
+    task_kind = _judge_task_kind(item, config)
+    if task_kind:
+        templates = _judge_prompt_templates(config)
+        variant = templates.get(task_kind)
+        if isinstance(variant, str) and variant.strip():
+            return variant
+    return default_fn()
+
+
 def _judge_score(item: dict[str, Any], response: str, config: dict[str, Any]) -> dict[str, Any]:
     has_feedback = _has_human_feedback(item)
-    system = _human_feedback_judge_system_prompt() if has_feedback else (
-        "You are evaluating a Gitmoot SkillOpt candidate response. "
-        "Return only JSON with keys hard, soft, fail_reason, and reasoning. "
-        "hard must be 0 or 1. soft must be a number from 0 to 1."
-    )
+
+    def _default_system_prompt() -> str:
+        if has_feedback:
+            return _human_feedback_judge_system_prompt()
+        return (
+            "You are evaluating a Gitmoot SkillOpt candidate response. "
+            "Return only JSON with keys hard, soft, fail_reason, and reasoning. "
+            "hard must be 0 or 1. soft must be a number from 0 to 1."
+        )
+
+    system = _resolve_judge_system_prompt(item, config, _default_system_prompt)
     user = "\n\n".join(
         [
             "## Evaluation Config",
