@@ -147,7 +147,6 @@ def fmt_minibatch_trajectories(
     parts: list[str] = []
     for idx, item in enumerate(items, 1):
         tid = str(item["id"])
-        metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
         prediction_id = str(item.get("prediction_id") or tid)
         conv_path = os.path.join(prediction_dir, prediction_id, "conversation.json")
         if not os.path.exists(conv_path):
