@@ -9,12 +9,17 @@ from typing import Any
 
 from gitmoot_skillopt.artifacts import ArtifactError, GitmootArtifactResolver
 from gitmoot_skillopt.contracts import ArtifactRef, EvalItem, TrainingPackage
-from skillopt.datasets.base import BaseDataLoader, BatchSpec
+from skillopt.datasets.base import (
+    BaseDataLoader,
+    BatchSpec,
+    HumanLabeledItem,
+    load_human_labeled_set,
+)
 from skillopt.envs.gitmoot.package import (
     artifact_ids_for_item,
     artifact_refs_by_id,
-    feedback_is_about_previous_outputs,
     feedback_events_for_item,
+    feedback_is_about_previous_outputs,
     json_safe_metadata,
     ranked_feedback_events_for_item,
     safe_item_path_segment,
@@ -54,6 +59,8 @@ class GitmootDataLoader(BaseDataLoader):
         self.package: TrainingPackage | None = None
         self.evaluator_config: dict[str, Any] = {}
         self._splits: dict[str, list[dict[str, Any]]] = {"train": [], "val": [], "test": []}
+        # #345 Phase 2: held-out human-labeled set (judge-prompt optimization).
+        self._human_labeled: list[HumanLabeledItem] = []
 
     def setup(self, cfg: dict) -> None:
         if not self.training_package:
@@ -77,6 +84,40 @@ class GitmootDataLoader(BaseDataLoader):
         self._splits = self._split_items(items)
         if self.limit:
             self._splits = {name: split_items[: self.limit] for name, split_items in self._splits.items()}
+        self._human_labeled = self._load_human_labeled(cfg)
+
+    def _load_human_labeled(self, cfg: dict) -> list[HumanLabeledItem]:
+        """Load the held-out human-labeled set for the agreement objective.
+
+        Reads ``cfg["judge"]["human_labeled_path"]`` (a JSON/JSONL path) or
+        ``cfg["judge"]["human_labeled"]`` (an inline list). The flat trainer
+        config exposes the same values as ``judge_human_labeled_path`` /
+        ``judge_human_labeled`` (see :mod:`skillopt.config`).
+        """
+        judge_cfg = cfg.get("judge") if isinstance(cfg.get("judge"), dict) else {}
+        source = (
+            cfg.get("judge_human_labeled")
+            or judge_cfg.get("human_labeled")
+            or cfg.get("judge_human_labeled_path")
+            or judge_cfg.get("human_labeled_path")
+        )
+        return load_human_labeled_set(source)
+
+    def human_labeled_items(self, task_kind: str = "") -> list[HumanLabeledItem]:
+        """Return the held-out human-labeled set, optionally task_kind-filtered.
+
+        When *task_kind* is empty, falls back to the evaluator profile's
+        ``task_kind`` so the judge-tuning path honors per-task_kind variant
+        selection without extra plumbing.
+        """
+        kind = str(task_kind or self.evaluator_config.get("task_kind") or "").strip()
+        if not kind:
+            return list(self._human_labeled)
+        return [
+            item
+            for item in self._human_labeled
+            if not item.task_kind or item.task_kind == kind
+        ]
 
     @property
     def initial_skill_content(self) -> str:

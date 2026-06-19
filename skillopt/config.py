@@ -23,7 +23,7 @@ import yaml
 # ── Section names that indicate a structured config ──────────────────────
 
 _STRUCTURED_SECTIONS = frozenset({
-    "model", "train", "gradient", "optimizer", "evaluation", "env",
+    "model", "train", "gradient", "optimizer", "evaluation", "env", "judge",
 })
 
 # ── Structured → flat key mapping ────────────────────────────────────────
@@ -116,6 +116,14 @@ _FLATTEN_MAP: dict[str, str] = {
     "env.name": "env",
     "env.skill_init": "skill_init",
     "env.out_root": "out_root",
+    # #345 Phase 2: judge-prompt optimization (frozen-and-alternated).
+    "judge.prompt_optimization": "judge_prompt_optimization",
+    "judge.mode": "judge_mode",
+    "judge.prompt_init": "judge_prompt_init",
+    "judge.prompt_version": "judge_prompt_version",
+    "judge.human_labeled_path": "judge_human_labeled_path",
+    "judge.human_labeled": "judge_human_labeled",
+    "judge.edit_budget": "judge_edit_budget",
 }
 
 
@@ -272,3 +280,51 @@ def load_config(
     if overrides:
         apply_overrides(cfg, overrides)
     return cfg
+
+
+# ── Judge-prompt optimization mode (#345 Phase 2) ─────────────────────────
+
+
+def judge_optimization_enabled(cfg: dict) -> bool:
+    """Return True when the config selects JUDGE-PROMPT tuning (not skill tuning).
+
+    Accepts a flat config (``judge_prompt_optimization: true`` or
+    ``judge_mode: "judge"``) or a structured config (``judge.prompt_optimization``
+    / ``judge.mode``). Defaults to ``False`` (skill tuning), preserving existing
+    behavior.
+    """
+    flat = flatten_config(cfg)
+    if bool(flat.get("judge_prompt_optimization", False)):
+        return True
+    mode = str(flat.get("judge_mode") or flat.get("mode") or "").strip().lower()
+    return mode == "judge"
+
+
+def judge_optimization_config(cfg: dict) -> dict[str, Any]:
+    """Resolve the judge-prompt optimization settings from *cfg*.
+
+    Enforces FREEZE-AND-ALTERNATE: the returned ``"mode"`` is exactly one of
+    ``"judge"`` (tune the judge prompt against held-out human agreement) or
+    ``"skill"`` (tune the skill against the frozen judge). The two never share a
+    signal within one loop — the flag selects one. Skill tuning runs against the
+    frozen judge; judge tuning runs against the frozen skill.
+
+    Returns
+    -------
+    dict
+        ``{"mode", "gate_metric", "human_labeled", "human_labeled_path",
+        "prompt_init", "prompt_version", "edit_budget"}``.
+    """
+    flat = flatten_config(cfg)
+    enabled = judge_optimization_enabled(cfg)
+    return {
+        "mode": "judge" if enabled else "skill",
+        # Judge tuning is gated on human agreement; skill tuning keeps its
+        # configured gate metric (default "hard").
+        "gate_metric": "human_agreement" if enabled else str(flat.get("gate_metric", "hard")),
+        "human_labeled": flat.get("judge_human_labeled"),
+        "human_labeled_path": flat.get("judge_human_labeled_path"),
+        "prompt_init": str(flat.get("judge_prompt_init") or ""),
+        "prompt_version": str(flat.get("judge_prompt_version") or ""),
+        "edit_budget": int(flat.get("judge_edit_budget", 4) or 4),
+    }

@@ -9,5 +9,8 @@ from skillopt.evaluation.gate import (  # noqa: F401
     GateMetric,
     GateResult,
     evaluate_gate,
+    evaluate_human_agreement_gate,
+    normalize_human_verdict,
+    score_human_agreement,
     select_gate_score,
 )

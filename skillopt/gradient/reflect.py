@@ -446,6 +446,116 @@ def run_success_analyst_minibatch(
     return None
 
 
+# ── Judge-prompt optimization (#345 Phase 2) ─────────────────────────────────
+
+
+def fmt_human_labeled_disagreements(
+    labeled_items: list,
+    judge_verdicts: dict | None = None,
+    *,
+    max_items: int = 12,
+) -> str:
+    """Format the held-out items where the judge disagreed with the human.
+
+    Feeds the judge-prompt analyst the agreement objective's failure cases so it
+    can propose targeted edits. *labeled_items* are
+    :class:`~skillopt.datasets.base.HumanLabeledItem` (or compatible dicts);
+    *judge_verdicts* maps item id → the judge's accept/reject verdict.
+    """
+    from skillopt.evaluation.gate import normalize_human_verdict
+
+    verdicts = judge_verdicts or {}
+    lines: list[str] = []
+    for item in labeled_items:
+        item_id = str(getattr(item, "id", None) if not isinstance(item, dict) else item.get("id"))
+        human_raw = getattr(item, "human_verdict", None) if not isinstance(item, dict) else item.get("human_verdict")
+        artifact = getattr(item, "artifact", None) if not isinstance(item, dict) else item.get("artifact")
+        judge_raw = verdicts.get(item_id)
+        try:
+            human = normalize_human_verdict(human_raw)
+        except ValueError:
+            continue
+        agree = judge_raw is not None and normalize_human_verdict(judge_raw) == human
+        if agree:
+            continue
+        lines.append(
+            f"### Disagreement (id={item_id})\n"
+            f"Human verdict: {'promote' if human else 'reject'}\n"
+            f"Judge verdict: {judge_raw if judge_raw is not None else 'no verdict'}\n"
+            f"Artifact: {_clip_text(artifact, 1500)}"
+        )
+        if len(lines) >= max_items:
+            break
+    return "\n\n---\n\n".join(lines)
+
+
+def propose_judge_prompt_edit(
+    judge_prompt: str,
+    labeled_items: list,
+    judge_verdicts: dict | None = None,
+    *,
+    task_kind: str = "",
+    edit_budget: int = 4,
+    system_prompt: str | None = None,
+) -> dict | None:
+    """Propose an edit to the JUDGE PROMPT to raise held-out human agreement.
+
+    This is the judge-tuning analog of :func:`run_error_analyst_minibatch`: the
+    optimization TARGET artifact is the judge-prompt text, and the analyst is
+    shown the held-out disagreements (where the judge's verdict differed from
+    the human's). Per-task_kind variant selection is honored — when *task_kind*
+    is set, it is threaded into the prompt so the analyst tunes the matching
+    judge variant.
+
+    Returns
+    -------
+    dict | None
+        ``{"patch": {...}, "source_type": "judge_human_agreement", "task_kind":
+        ...}`` or ``None`` on error / empty disagreement set.
+    """
+    disagreements = fmt_human_labeled_disagreements(labeled_items, judge_verdicts)
+    if not disagreements.strip():
+        return None
+
+    actual_system = system_prompt
+    if actual_system is None:
+        try:
+            actual_system = load_prompt("judge_prompt_analyst")
+        except FileNotFoundError:
+            actual_system = (
+                "You optimize an LLM-judge prompt. Given the current judge prompt "
+                "and held-out cases where the judge disagreed with human reviewers, "
+                "propose edits to the judge prompt so its accept/reject verdicts "
+                "better match the humans. Output JSON with a 'patch' field."
+            )
+
+    user = f"## Current Judge Prompt\n{judge_prompt}\n\n"
+    if task_kind:
+        user += f"## Judge Variant\ntask_kind={task_kind}\n\n"
+    user += (
+        f"## Edit Budget\nProduce at most L={edit_budget} edits.\n\n"
+        f"## Held-Out Human Disagreements\n{disagreements}"
+    )
+
+    try:
+        response, _ = chat_optimizer(
+            system=actual_system,
+            user=user,
+            max_completion_tokens=4096,
+            retries=3,
+            stage="analyst",
+        )
+        result = extract_json(response)
+        if result and "patch" in result:
+            result["source_type"] = "judge_human_agreement"
+            if task_kind:
+                result["task_kind"] = task_kind
+            return result
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+    return None
+
+
 # ── Minibatch reflect dispatcher ────────────────────────────────────────────
 
 

@@ -9,7 +9,7 @@ mutation).  This module is the pure decision function.
 
 Metric selection
 ----------------
-Three gate metrics are supported:
+Four gate metrics are supported:
 
 * ``"hard"`` (default, backward-compatible):
   Compare candidate vs current/best using *hard* exact-match accuracy.
@@ -20,14 +20,26 @@ Three gate metrics are supported:
 * ``"mixed"``:
   Compare using a weighted average ``(1 - w) * hard + w * soft``.
   ``w`` is configurable via ``mixed_weight`` (default ``0.5``).
+* ``"human_agreement"`` (#345 Phase 2, judge-prompt optimization):
+  Compare using the fraction of a labeled held-out set on which the
+  judge's accept/reject verdict matches the human verdict. This is the
+  objective used when tuning the *judge prompt* (not the skill) — see
+  :func:`score_human_agreement` and :func:`evaluate_human_agreement_gate`.
+  It does not consume rollout hard/soft scores; the caller supplies the
+  agreement fractions directly.
 """
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
 
 GateAction = Literal["accept_new_best", "accept", "reject"]
-GateMetric = Literal["hard", "soft", "mixed"]
+GateMetric = Literal["hard", "soft", "mixed", "human_agreement"]
+
+# Canonical human verdict labels accepted in a held-out labeled set.
+_PROMOTE_LABELS = frozenset({"promote", "accept", "yes", "approve", "approved", "pass", "true", "1"})
+_REJECT_LABELS = frozenset({"reject", "deny", "no", "fail", "false", "0"})
 
 
 @dataclass(frozen=True)
@@ -93,8 +105,15 @@ def select_gate_score(
     if metric == "mixed":
         w = max(0.0, min(1.0, float(mixed_weight)))
         return (1.0 - w) * float(hard) + w * float(soft)
+    if metric == "human_agreement":
+        # The human-agreement objective is computed by ``score_human_agreement``
+        # against a labeled held-out set, not projected from rollout hard/soft.
+        # When this projection is reached, ``hard`` already carries the
+        # pre-computed agreement fraction (the judge-tuning path passes it as
+        # ``cand_hard``), so we surface it directly.
+        return float(hard)
     raise ValueError(
-        f"unknown gate metric {metric!r}; expected 'hard', 'soft', or 'mixed'"
+        f"unknown gate metric {metric!r}; expected 'hard', 'soft', 'mixed', or 'human_agreement'"
     )
 
 
@@ -229,4 +248,110 @@ def evaluate_gate(
         best_skill=best_skill,
         best_score=best_score,
         best_step=best_step,
+    )
+
+
+# ── Human-agreement objective (#345 Phase 2, judge-prompt optimization) ─────
+
+
+def normalize_human_verdict(verdict: Any) -> bool:
+    """Map a human verdict label to a boolean ``promote`` decision.
+
+    Accepts the canonical ``"promote"`` / ``"reject"`` labels (and a few common
+    synonyms / booleans). Raises ``ValueError`` for anything unrecognised so a
+    mislabeled held-out set fails loudly rather than silently scoring wrong.
+    """
+    if isinstance(verdict, bool):
+        return verdict
+    token = str(verdict).strip().lower()
+    if token in _PROMOTE_LABELS:
+        return True
+    if token in _REJECT_LABELS:
+        return False
+    raise ValueError(
+        f"unknown human verdict {verdict!r}; expected one of "
+        f"{sorted(_PROMOTE_LABELS)} or {sorted(_REJECT_LABELS)}"
+    )
+
+
+def score_human_agreement(
+    labeled_items: Iterable[Mapping[str, Any]],
+    judge_verdicts: Mapping[str, Any] | Iterable[Any],
+    *,
+    id_key: str = "id",
+    human_key: str = "human_verdict",
+) -> float:
+    """Fraction of a labeled held-out set where judge verdict == human verdict.
+
+    Parameters
+    ----------
+    labeled_items
+        The held-out human-labeled set. Each item is a mapping carrying at least
+        a human verdict under *human_key* (and, for the mapping form of
+        *judge_verdicts*, an id under *id_key*).
+    judge_verdicts
+        Either a mapping ``{item_id: judge_verdict}`` or a positional iterable of
+        judge verdicts aligned with *labeled_items*. Each verdict is normalised
+        via :func:`normalize_human_verdict` (accept/promote → ``True``).
+    id_key, human_key
+        Field names used to read the item id and the human verdict.
+
+    Returns
+    -------
+    float
+        Agreement fraction in ``[0, 1]``. An empty labeled set scores ``0.0``.
+    """
+    items = list(labeled_items)
+    if not items:
+        return 0.0
+
+    if isinstance(judge_verdicts, Mapping):
+        def _judge_for(idx: int, item: Mapping[str, Any]) -> Any:
+            return judge_verdicts.get(str(item.get(id_key)))
+    else:
+        verdict_list = list(judge_verdicts)
+
+        def _judge_for(idx: int, item: Mapping[str, Any]) -> Any:
+            return verdict_list[idx] if idx < len(verdict_list) else None
+
+    agree = 0
+    for idx, item in enumerate(items):
+        human = normalize_human_verdict(item[human_key])
+        raw_judge = _judge_for(idx, item)
+        if raw_judge is None:
+            # A missing judge verdict is treated as disagreement (the judge
+            # failed to render a verdict on a labeled item).
+            continue
+        if normalize_human_verdict(raw_judge) == human:
+            agree += 1
+    return agree / len(items)
+
+
+def evaluate_human_agreement_gate(
+    candidate_prompt: str,
+    cand_agreement: float,
+    current_prompt: str,
+    current_agreement: float,
+    best_prompt: str,
+    best_agreement: float,
+    best_step: int,
+    global_step: int,
+) -> GateResult:
+    """Gate a candidate *judge prompt* on held-out human agreement.
+
+    Mirrors :func:`evaluate_gate`'s accept-if-improves logic, but the comparison
+    quantity is the held-out human-agreement fraction rather than rollout
+    hard/soft. Returns a :class:`GateResult` whose ``*_skill`` fields carry the
+    judge-prompt text (the optimized artifact in this mode).
+    """
+    return evaluate_gate(
+        candidate_skill=candidate_prompt,
+        cand_hard=float(cand_agreement),
+        current_skill=current_prompt,
+        current_score=float(current_agreement),
+        best_skill=best_prompt,
+        best_score=float(best_agreement),
+        best_step=best_step,
+        global_step=global_step,
+        metric="human_agreement",
     )
