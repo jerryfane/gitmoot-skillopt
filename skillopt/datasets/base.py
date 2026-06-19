@@ -39,6 +39,125 @@ from typing import Any
 
 
 @dataclass(slots=True)
+class HumanLabeledItem:
+    """One ground-truth example in a held-out human-labeled set (#345 Phase 2).
+
+    Used as the agreement objective for judge-prompt optimization: each item
+    pairs a candidate artifact / trajectory with the human's accept/reject
+    verdict, so we can score how often the judge agrees with humans.
+
+    Parameters
+    ----------
+    id : str
+        Stable identifier; used to align judge verdicts back to labels.
+    human_verdict : str
+        Ground-truth verdict, canonically ``"promote"`` or ``"reject"``.
+    artifact : Any
+        The candidate artifact / trajectory the human judged. Opaque to the
+        loader — the judge sees it when rendering its own verdict.
+    task_kind : str
+        Optional task-kind / profile tag, enabling per-task_kind variant
+        selection in the judge-tuning path.
+    metadata : dict[str, Any]
+        Free-form structured context (review ids, prompts, etc.).
+    """
+
+    id: str
+    human_verdict: str
+    artifact: Any = None
+    task_kind: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "human_verdict": self.human_verdict,
+            "artifact": self.artifact,
+            "task_kind": self.task_kind,
+            "metadata": self.metadata,
+        }
+
+
+def _canonical_human_verdict(value: Any) -> str:
+    """Normalize a raw verdict to canonical ``"promote"`` / ``"reject"``.
+
+    Delegates to the human-agreement gate's normalizer so the held-out loader
+    and the gate accept exactly the same verdict labels (#345). Local import
+    avoids any package-init import cycle between datasets and evaluation.
+    """
+    from skillopt.evaluation.gate import normalize_human_verdict
+
+    return "promote" if normalize_human_verdict(value) else "reject"
+
+
+def load_human_labeled_set(
+    source: str | list[dict] | None,
+    *,
+    task_kind: str = "",
+    artifact_key: str = "artifact",
+) -> list[HumanLabeledItem]:
+    """Load a held-out human-labeled set for the agreement objective (#345).
+
+    Parameters
+    ----------
+    source
+        Either a path to a JSON / JSONL file holding a list of
+        ``{id?, human_verdict, artifact?/trajectory?, task_kind?, ...}`` dicts,
+        or the inline list itself. ``None`` / empty returns ``[]``.
+    task_kind
+        When non-empty, only items whose own ``task_kind`` matches (or that
+        carry no ``task_kind``) are returned — enabling per-task_kind variant
+        selection in the judge-tuning path.
+    artifact_key
+        Field name to read the judged artifact from; falls back to
+        ``"trajectory"`` then ``"output"`` for convenience.
+
+    Returns
+    -------
+    list[HumanLabeledItem]
+        Validated, canonicalized labeled items (``human_verdict`` is normalized
+        to ``"promote"`` / ``"reject"``).
+    """
+    if not source:
+        return []
+
+    if isinstance(source, str):
+        raw = _load_json_or_jsonl(source)
+    elif isinstance(source, list):
+        raw = source
+    else:
+        raise TypeError(
+            f"human-labeled source must be a path or list, got {type(source).__name__}"
+        )
+
+    items: list[HumanLabeledItem] = []
+    for idx, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"human-labeled entry #{idx} must be a dict, got {type(entry).__name__}"
+            )
+        if "human_verdict" not in entry:
+            raise ValueError(f"human-labeled entry #{idx} is missing 'human_verdict'")
+        item_task_kind = str(entry.get("task_kind") or "").strip()
+        if task_kind and item_task_kind and item_task_kind != task_kind:
+            continue
+        artifact = entry.get(artifact_key)
+        if artifact is None:
+            artifact = entry.get("trajectory", entry.get("output"))
+        metadata = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else {}
+        items.append(
+            HumanLabeledItem(
+                id=str(entry.get("id", idx)),
+                human_verdict=_canonical_human_verdict(entry["human_verdict"]),
+                artifact=artifact,
+                task_kind=item_task_kind,
+                metadata=dict(metadata),
+            )
+        )
+    return items
+
+
+@dataclass(slots=True)
 class BatchSpec:
     """A concrete batch request consumed by the training loop.
 

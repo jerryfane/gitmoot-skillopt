@@ -27,7 +27,13 @@ from typing import Any
 from skillopt.datasets.base import BatchSpec
 from skillopt.envs.base import EnvAdapter
 from skillopt.envs.gitmoot.package import safe_item_path_segment
-from skillopt.evaluation.gate import evaluate_gate, find_gate_block, select_gate_score
+from skillopt.evaluation.gate import (
+    evaluate_gate,
+    evaluate_human_agreement_gate,
+    find_gate_block,
+    score_human_agreement,
+    select_gate_score,
+)
 from skillopt.gradient.aggregate import merge_patches
 from skillopt.model import (
     configure_azure_openai,
@@ -2017,6 +2023,130 @@ def _blocked_training_summary(
     }
 
 
+@dataclass(frozen=True)
+class JudgePromptCandidate:
+    """A candidate judge prompt + its verdicts on the held-out labeled set.
+
+    Used by :func:`run_judge_prompt_optimization` (#345 Phase 2). ``verdicts``
+    maps held-out item id → the judge's accept/reject verdict when run with this
+    prompt. ``task_kind`` enables per-task_kind variant selection.
+    """
+
+    prompt: str
+    verdicts: dict[str, Any]
+    origin: str = "candidate"
+    task_kind: str = ""
+
+
+@dataclass(frozen=True)
+class JudgeOptimizationResult:
+    """Outcome of one judge-prompt optimization pass."""
+
+    best_prompt: str
+    best_agreement: float
+    best_origin: str
+    judge_prompt_version: str
+    baseline_agreement: float
+    history: list[dict[str, Any]]
+
+
+def run_judge_prompt_optimization(
+    baseline_prompt: str,
+    candidates: list[JudgePromptCandidate],
+    labeled_items: list,
+    *,
+    baseline_verdicts: dict[str, Any] | None = None,
+    base_version: str = "v0",
+    task_kind: str = "",
+) -> JudgeOptimizationResult:
+    """Tune a JUDGE PROMPT against held-out human agreement (#345 Phase 2).
+
+    This is the freeze-and-alternate counterpart to the skill-tuning loop: the
+    optimization TARGET artifact is the judge-prompt text, the gate metric is
+    ``"human_agreement"``, and the ground truth is a held-out human-labeled set.
+    Each candidate carries the judge verdicts it produced on the labeled set; we
+    score agreement, gate accept-if-improves (mirroring :func:`evaluate_gate`),
+    select the best prompt, and stamp a ``judge_prompt_version`` on it.
+
+    Per-task_kind variant selection is honored: when *task_kind* is set, only
+    candidates with a matching (or empty) ``task_kind`` are considered, so the
+    correct judge variant is tuned.
+
+    Skill tuning runs against the *frozen* judge produced here; this function
+    never touches skill scores — the two signals never mix in one loop.
+    """
+    if task_kind:
+        labeled_items = [
+            item
+            for item in labeled_items
+            if not str(getattr(item, "task_kind", "") or (item.get("task_kind") if isinstance(item, dict) else "")).strip()
+            or str(getattr(item, "task_kind", "") or (item.get("task_kind") if isinstance(item, dict) else "")).strip() == task_kind
+        ]
+
+    labeled_dicts = [item.to_dict() if hasattr(item, "to_dict") else dict(item) for item in labeled_items]
+
+    baseline_agreement = score_human_agreement(labeled_dicts, baseline_verdicts or {})
+    best_prompt = baseline_prompt
+    best_agreement = baseline_agreement
+    best_origin = "baseline_judge"
+    accepted_version = base_version
+    history: list[dict[str, Any]] = [
+        {
+            "origin": "baseline_judge",
+            "agreement": baseline_agreement,
+            "action": "baseline",
+            "judge_prompt_version": base_version,
+        }
+    ]
+
+    current_prompt = baseline_prompt
+    current_agreement = baseline_agreement
+    accepts = 0
+    for step, candidate in enumerate(candidates, start=1):
+        if task_kind and candidate.task_kind and candidate.task_kind != task_kind:
+            history.append(
+                {"origin": candidate.origin, "action": "skipped_task_kind", "task_kind": candidate.task_kind}
+            )
+            continue
+        cand_agreement = score_human_agreement(labeled_dicts, candidate.verdicts)
+        gate = evaluate_human_agreement_gate(
+            candidate_prompt=candidate.prompt,
+            cand_agreement=cand_agreement,
+            current_prompt=current_prompt,
+            current_agreement=current_agreement,
+            best_prompt=best_prompt,
+            best_agreement=best_agreement,
+            best_step=0,
+            global_step=step,
+        )
+        record = {
+            "origin": candidate.origin,
+            "agreement": cand_agreement,
+            "action": gate.action,
+            "task_kind": candidate.task_kind,
+        }
+        if gate.action != "reject":
+            current_prompt = gate.current_skill
+            current_agreement = gate.current_score
+        if gate.action == "accept_new_best":
+            accepts += 1
+            best_prompt = gate.best_skill
+            best_agreement = gate.best_score
+            best_origin = candidate.origin
+            accepted_version = f"{base_version}+judge{accepts}"
+            record["judge_prompt_version"] = accepted_version
+        history.append(record)
+
+    return JudgeOptimizationResult(
+        best_prompt=best_prompt,
+        best_agreement=best_agreement,
+        best_origin=best_origin,
+        judge_prompt_version=accepted_version,
+        baseline_agreement=baseline_agreement,
+        history=history,
+    )
+
+
 def _best_selection_scores(
     *,
     history: list[dict],
@@ -2916,10 +3046,10 @@ class ReflACTTrainer:
                 "`evaluation.use_gate=false` from the config."
             )
         gate_metric = str(cfg.get("gate_metric", "hard")).strip().lower()
-        if gate_metric not in {"hard", "soft", "mixed"}:
+        if gate_metric not in {"hard", "soft", "mixed", "human_agreement"}:
             raise ValueError(
-                f"evaluation.gate_metric must be 'hard' | 'soft' | 'mixed', "
-                f"got {gate_metric!r}"
+                f"evaluation.gate_metric must be 'hard' | 'soft' | 'mixed' | "
+                f"'human_agreement', got {gate_metric!r}"
             )
         gate_mixed_weight = float(cfg.get("gate_mixed_weight", 0.5))
         if not 0.0 <= gate_mixed_weight <= 1.0:

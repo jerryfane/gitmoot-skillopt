@@ -47,6 +47,7 @@ nav:
   - Core Concepts:
     - Training Loop: guide/training-loop.md
     - Skill Document: guide/skill-document.md
+    - Judge-Prompt Optimization: guide/judge-prompt-optimization.md
     - Deep Learning Analogy: guide/dl-analogy.md
   - Extension Guides:
     - Add a New Benchmark: guide/new-benchmark.md
