@@ -33,6 +33,28 @@ workflow, see
 For a no-network contract smoke, run the fixture command in that guide with
 `--dry-run`.
 
+### Judge-Prompt Optimization
+
+For LLM-judged tasks, the judge prompt is itself a per-`task_kind`, versioned,
+optimizable artifact. It is tuned against a held-out **human-agreement**
+objective (not the skill scores it produces) under three guardrails:
+
+- **Independent ground-truth objective** — the judge is tuned to match held-out
+  human labels, never to maximize a skill's score.
+- **Frozen and alternated** — the judge is tuned on its own loop, then frozen
+  while skills are optimized against it; the two never run at once.
+- **Hierarchical scope** — judge prompts resolve global → `task_kind` →
+  per-prompt.
+
+This is **offline and capped**: it reuses already-captured human-labeled data
+(no new rollouts) and runs infrequently. Normal skill runs use the **frozen
+judge at today's cost**; re-tuning the judge inside every skill run is the
+anti-pattern. Gitmoot carries the active prompt and version in the training
+package at `evaluator_profile.judge.config.judge_prompt_templates` and
+`evaluator_profile.judge.config.judge_prompt_version`. See
+[`docs/guide/judge-prompt-optimization.md`](docs/guide/judge-prompt-optimization.md)
+for the full treatment.
+
 ## Upstream SkillOpt
 
 # SkillOpt: Executive Strategy for Self-Evolving Agent Skills
