@@ -466,8 +466,27 @@ def _evaluator_profile_config(package: TrainingPackage) -> dict[str, Any]:
         config["profile_id"] = profile.profile_id
     if profile.checks:
         config["checks"] = [check.to_dict() for check in profile.checks]
-    if profile.judge is not None and profile.judge.model:
-        config["evaluator_model"] = profile.judge.model
+    if profile.judge is not None:
+        if profile.judge.model:
+            config["evaluator_model"] = profile.judge.model
+        # #345 Phase 2: surface the per-task_kind judge prompts + version that the
+        # gitmoot Go side stamps at evaluator_profile.judge.config, so the
+        # evaluator's _resolve_judge_system_prompt can pick the variant. Placed at
+        # the top level of evaluator_config, where the resolver looks first.
+        judge_config = profile.judge.config
+        if isinstance(judge_config, dict):
+            templates = judge_config.get("judge_prompt_templates")
+            if isinstance(templates, dict):
+                cleaned = {
+                    str(k): v
+                    for k, v in templates.items()
+                    if isinstance(v, str) and v.strip()
+                }
+                if cleaned:
+                    config["judge_prompt_templates"] = cleaned
+            version = judge_config.get("judge_prompt_version")
+            if isinstance(version, str) and version.strip():
+                config["judge_prompt_version"] = version.strip()
     if _profile_requires_landing_page_mode(config):
         config["mode"] = "landing_page_v1"
     return config

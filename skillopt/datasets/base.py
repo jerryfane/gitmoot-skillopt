@@ -78,23 +78,16 @@ class HumanLabeledItem:
         }
 
 
-_PROMOTE_VERDICTS = frozenset({"promote", "accept", "yes", "approve", "approved", "pass"})
-_REJECT_VERDICTS = frozenset({"reject", "deny", "no", "fail"})
-
-
 def _canonical_human_verdict(value: Any) -> str:
-    """Normalize a raw verdict to canonical ``"promote"`` / ``"reject"``."""
-    if isinstance(value, bool):
-        return "promote" if value else "reject"
-    token = str(value).strip().lower()
-    if token in _PROMOTE_VERDICTS:
-        return "promote"
-    if token in _REJECT_VERDICTS:
-        return "reject"
-    raise ValueError(
-        f"human_verdict must be one of {sorted(_PROMOTE_VERDICTS)} "
-        f"or {sorted(_REJECT_VERDICTS)}, got {value!r}"
-    )
+    """Normalize a raw verdict to canonical ``"promote"`` / ``"reject"``.
+
+    Delegates to the human-agreement gate's normalizer so the held-out loader
+    and the gate accept exactly the same verdict labels (#345). Local import
+    avoids any package-init import cycle between datasets and evaluation.
+    """
+    from skillopt.evaluation.gate import normalize_human_verdict
+
+    return "promote" if normalize_human_verdict(value) else "reject"
 
 
 def load_human_labeled_set(
