@@ -1130,6 +1130,77 @@ def _judge_score(item: dict[str, Any], response: str, config: dict[str, Any]) ->
     return score
 
 
+# ── Judge-prompt verdict runner (#345 Phase 2) ───────────────────────────────
+
+DEFAULT_JUDGE_VERDICT_PROMPT = (
+    "You are an LLM judge deciding whether a candidate artifact is good enough to "
+    "PROMOTE (ship it to a human) or should be REJECTED (it needs more work). "
+    "Judge the artifact on correctness, completeness, and quality against what the "
+    "task evidently requires. Be decisive and consistent."
+)
+
+_JUDGE_VERDICT_OUTPUT_INSTRUCTION = (
+    'Return ONLY a JSON object: {"verdict": "promote" or "reject", '
+    '"reasoning": "<one short sentence>"}.'
+)
+
+
+def run_judge_prompt_over_labeled(
+    judge_prompt: str,
+    labeled_items: list,
+    config: dict[str, Any],
+    *,
+    stage: str = "judge_prompt_verdict",
+    max_completion_tokens: int = 1024,
+    retries: int = 2,
+    max_artifact_chars: int = 6000,
+) -> dict[str, Any]:
+    """Run a JUDGE PROMPT over held-out items and return ``{item_id: verdict}``.
+
+    The verdict-output contract (a ``{"verdict": ...}`` JSON object) is enforced
+    here so the optimizer tunes the judge CRITERIA, not the output format. The
+    judge call routes through :func:`_chat_evaluator`, so the evaluator backend /
+    model carried in *config* (e.g. codex) is honored. A failed/unparseable call
+    yields a ``None`` verdict for that item (scored as a disagreement upstream).
+    This is the missing primitive that produces ``JudgePromptCandidate.verdicts``
+    in a real run (#345 Phase 2).
+    """
+    verdicts: dict[str, Any] = {}
+    system = (judge_prompt or DEFAULT_JUDGE_VERDICT_PROMPT).strip() or DEFAULT_JUDGE_VERDICT_PROMPT
+    for item in labeled_items:
+        if isinstance(item, dict):
+            item_id = str(item.get("id"))
+            artifact = item.get("artifact")
+        else:
+            item_id = str(getattr(item, "id", None))
+            artifact = getattr(item, "artifact", None)
+        artifact_text = artifact if isinstance(artifact, str) else json.dumps(artifact, ensure_ascii=False, default=str)
+        if len(artifact_text) > max_artifact_chars:
+            artifact_text = artifact_text[:max_artifact_chars] + "\n…[truncated]"
+        user = (
+            "## Candidate Artifact\n"
+            f"{artifact_text}\n\n"
+            f"## Output Format\n{_JUDGE_VERDICT_OUTPUT_INSTRUCTION}"
+        )
+        verdict: Any = None
+        try:
+            raw, _usage = _chat_evaluator(
+                config,
+                system=system,
+                user=user,
+                max_completion_tokens=max_completion_tokens,
+                retries=retries,
+                stage=stage,
+            )
+            parsed = extract_json(raw)
+            if isinstance(parsed, dict):
+                verdict = parsed.get("verdict")
+        except Exception:  # noqa: BLE001
+            verdict = None
+        verdicts[item_id] = verdict
+    return verdicts
+
+
 def _landing_page_score(item: dict[str, Any], response: str, config: dict[str, Any]) -> dict[str, Any]:
     render_result: dict[str, Any] | None = None
     rubric = _compose_evaluator_rubric(item, config)

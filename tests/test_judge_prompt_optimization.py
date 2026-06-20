@@ -501,3 +501,260 @@ def test_trainer_rejects_unknown_gate_metric(tmp_path):
 
     with pytest.raises(ValueError, match="gate_metric"):
         ReflACTTrainer(cfg, _GateMetricFakeAdapter()).train()
+
+
+# ── judge-loop orchestration (#345 Phase 2 wiring) ──────────────────────────
+
+
+def _human():
+    return {"a": "promote", "b": "reject", "c": "promote", "d": "reject"}
+
+
+def _labeled_abcd():
+    h = _human()
+    return [HumanLabeledItem(id=k, human_verdict=v, artifact=k.upper()) for k, v in h.items()]
+
+
+def test_optimize_judge_prompts_accepts_better_agreeing_candidate():
+    from skillopt.engine.judge_loop import optimize_judge_prompts
+
+    human = _human()
+
+    def judge_runner(prompt, items):
+        if prompt == "BETTER":
+            return {it.id: human[it.id] for it in items}  # perfect agreement
+        return {it.id: "promote" for it in items}  # baseline: matches only the promotes
+
+    def proposer(prompt, items, verdicts, task_kind, budget):
+        return "BETTER"
+
+    result = optimize_judge_prompts(
+        "baseline judge",
+        _labeled_abcd(),
+        judge_runner=judge_runner,
+        proposer=proposer,
+        base_version="v1",
+    )
+    g = result["variants"]["_global"]
+    assert g["baseline_agreement"] == 0.5
+    assert g["best_agreement"] == 1.0
+    assert g["accepted"] is True
+    assert g["best_prompt"] == "BETTER"
+    assert g["judge_prompt_version"] == "v1+judge1"
+    assert result["kind"] == "gitmoot-skillopt-judge-candidate"
+    assert result["n_labeled"] == 4
+
+
+def test_optimize_judge_prompts_rejects_worse_candidate():
+    from skillopt.engine.judge_loop import optimize_judge_prompts
+
+    human = _human()
+
+    def judge_runner(prompt, items):
+        if prompt == "WORSE":
+            return {it.id: "reject" for it in items}  # matches only the rejects
+        return {it.id: human[it.id] for it in items}  # baseline: perfect
+
+    def proposer(prompt, items, verdicts, task_kind, budget):
+        return "WORSE"
+
+    result = optimize_judge_prompts(
+        "baseline judge",
+        _labeled_abcd(),
+        judge_runner=judge_runner,
+        proposer=proposer,
+        base_version="v1",
+    )
+    g = result["variants"]["_global"]
+    assert g["baseline_agreement"] == 1.0
+    assert g["best_agreement"] == 1.0
+    assert g["accepted"] is False
+    assert g["best_origin"] == "baseline_judge"
+    assert g["best_prompt"] == "baseline judge"
+
+
+def test_optimize_judge_prompts_per_task_kind_variants():
+    from skillopt.engine.judge_loop import optimize_judge_prompts
+
+    human = {"lp-1": "promote", "lp-2": "reject", "w-1": "promote"}
+    labeled = [
+        HumanLabeledItem(id="lp-1", human_verdict="promote", artifact="x", task_kind="landing"),
+        HumanLabeledItem(id="lp-2", human_verdict="reject", artifact="y", task_kind="landing"),
+        HumanLabeledItem(id="w-1", human_verdict="promote", artifact="z", task_kind="writing"),
+    ]
+
+    def judge_runner(prompt, items):
+        # A "fix:<kind>" prompt makes that kind's items agree; otherwise promote-all.
+        out = {}
+        for it in items:
+            out[it.id] = human[it.id] if prompt == f"fix:{it.task_kind}" else "promote"
+        return out
+
+    def proposer(prompt, items, verdicts, task_kind, budget):
+        return f"fix:{task_kind}" if task_kind else "fix:global"
+
+    result = optimize_judge_prompts(
+        "baseline",
+        labeled,
+        judge_runner=judge_runner,
+        proposer=proposer,
+        base_version="v2",
+    )
+    variants = result["variants"]
+    assert set(variants) == {"_global", "landing", "writing"}
+    # The landing variant: baseline promotes both lp items (lp-2 is a reject) → 0.5;
+    # the fix:landing candidate agrees on both → 1.0, accepted.
+    assert variants["landing"]["baseline_agreement"] == 0.5
+    assert variants["landing"]["best_agreement"] == 1.0
+    assert variants["landing"]["accepted"] is True
+    assert variants["landing"]["best_prompt"] == "fix:landing"
+    # The writing variant only sees w-1 (promote): baseline already agrees → 1.0.
+    assert variants["writing"]["n_items"] == 1
+    assert variants["writing"]["best_agreement"] == 1.0
+
+
+def test_run_judge_prompt_over_labeled_parses_and_truncates(monkeypatch):
+    import skillopt.envs.gitmoot.evaluator as evaluator_mod
+
+    seen_users = []
+
+    def fake_chat(config, *, system, user, **kwargs):
+        seen_users.append(user)
+        if "AAA" in user:
+            return ('{"verdict": "promote", "reasoning": "ok"}', {})
+        if "BBB" in user:
+            return ("not json at all", {})
+        return ('{"verdict": "reject"}', {})
+
+    monkeypatch.setattr(evaluator_mod, "_chat_evaluator", fake_chat)
+
+    items = [
+        HumanLabeledItem(id="a", human_verdict="promote", artifact="AAA"),
+        HumanLabeledItem(id="b", human_verdict="reject", artifact="BBB"),
+        HumanLabeledItem(id="c", human_verdict="reject", artifact="CCC" + "x" * 9000),
+    ]
+    verdicts = evaluator_mod.run_judge_prompt_over_labeled(
+        "judge prompt", items, {"evaluator_backend": "fake", "evaluator_model": "m"}, max_artifact_chars=200
+    )
+    assert verdicts == {"a": "promote", "b": None, "c": "reject"}
+    # The oversized artifact is truncated before it reaches the judge.
+    long_user = [u for u in seen_users if u.startswith("## Candidate Artifact\nCCC")][0]
+    assert "…[truncated]" in long_user
+
+
+def test_run_judge_optimize_writes_candidate_package(tmp_path, monkeypatch):
+    from gitmoot_skillopt import judge_optimize as jo
+    from gitmoot_skillopt.cli import main
+    from gitmoot_skillopt.preflight import JudgePreflightResult
+
+    package_path, artifact_root = write_training_package(tmp_path)
+    labels_path = tmp_path / "labels.json"
+    labels_path.write_text(
+        json.dumps(
+            [
+                {"id": "a", "human_verdict": "promote", "artifact": "A"},
+                {"id": "b", "human_verdict": "reject", "artifact": "B"},
+                {"id": "c", "human_verdict": "promote", "artifact": "C"},
+                {"id": "d", "human_verdict": "reject", "artifact": "D"},
+            ]
+        ),
+        encoding="utf-8",
+    )
+    human = _human()
+
+    def fake_preflight(package, **kwargs):
+        return JudgePreflightResult(
+            optimizer_backend="fake",
+            evaluator_backend="fake",
+            optimizer_model="m",
+            evaluator_model="m",
+            evaluator_config={"evaluator_backend": "fake", "evaluator_model": "m"},
+        )
+
+    def fake_runner(prompt, items, config, **kwargs):
+        if prompt == "BETTER JUDGE":
+            return {it.id: human[it.id] for it in items}
+        return {it.id: "promote" for it in items}
+
+    def fake_propose(prompt, items, verdicts, *, task_kind="", edit_budget=4, system_prompt=None):
+        return {"patch": {"edits": [{"op": "noop"}]}, "source_type": "judge_human_agreement"}
+
+    monkeypatch.setattr(jo, "run_judge_preflight", fake_preflight)
+    monkeypatch.setattr(jo, "run_judge_prompt_over_labeled", fake_runner)
+    monkeypatch.setattr(jo, "propose_judge_prompt_edit", fake_propose)
+    monkeypatch.setattr(jo, "apply_patch", lambda prompt, patch: "BETTER JUDGE")
+
+    out_root = tmp_path / "out"
+    candidate_output = out_root / "judge_candidate.json"
+    code = main(
+        [
+            "optimize",
+            "--training-package",
+            str(package_path),
+            "--artifact-root",
+            str(artifact_root),
+            "--out-root",
+            str(out_root),
+            "--candidate-output",
+            str(candidate_output),
+            "--judge-prompt-optimization",
+            "--judge-human-labeled-path",
+            str(labels_path),
+            "--judge-prompt-version",
+            "v3",
+        ]
+    )
+    assert code == 0
+    written = json.loads(candidate_output.read_text(encoding="utf-8"))
+    assert written["kind"] == "gitmoot-skillopt-judge-candidate"
+    g = written["variants"]["_global"]
+    assert g["baseline_agreement"] == 0.5
+    assert g["best_agreement"] == 1.0
+    assert g["accepted"] is True
+    assert g["judge_prompt_version"] == "v3+judge1"
+
+
+def test_judge_optimization_requires_labeled_path():
+    from gitmoot_skillopt.cli import main
+
+    code = main(
+        [
+            "optimize",
+            "--training-package",
+            "x.json",
+            "--artifact-root",
+            "y",
+            "--out-root",
+            "z",
+            "--candidate-output",
+            "c.json",
+            "--judge-prompt-optimization",
+        ]
+    )
+    assert code == 2
+
+
+def test_optimize_judge_prompts_memoizes_baseline_verdicts_across_passes():
+    from skillopt.engine.judge_loop import optimize_judge_prompts
+
+    labeled = [
+        HumanLabeledItem(id="a1", human_verdict="promote", task_kind="A", artifact="x"),
+        HumanLabeledItem(id="a2", human_verdict="reject", task_kind="A", artifact="x"),
+        HumanLabeledItem(id="b1", human_verdict="promote", task_kind="B", artifact="x"),
+        HumanLabeledItem(id="u1", human_verdict="reject", task_kind="", artifact="x"),
+    ]
+    judged: list[str] = []
+
+    def judge_runner(prompt, items):
+        judged.extend(it.id for it in items)
+        return {it.id: "promote" for it in items}
+
+    def proposer(prompt, items, verdicts, task_kind, budget):
+        return None  # isolate baseline calls
+
+    optimize_judge_prompts("base judge", labeled, judge_runner=judge_runner, proposer=proposer)
+    # Passes: global(a1,a2,b1,u1) + A(a1,a2,u1) + B(b1,u1). Without caching that is
+    # 4+3+2 = 9 baseline item judgements; memoized by (prompt, id) it is 4 — each
+    # item judged once for the single baseline prompt.
+    assert len(judged) == 4
+    assert sorted(judged) == ["a1", "a2", "b1", "u1"]
