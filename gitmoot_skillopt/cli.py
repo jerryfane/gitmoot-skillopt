@@ -173,6 +173,35 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="run final test evaluation after selection; disabled by default for Gitmoot human-review flows",
     )
+    optimize.add_argument(
+        "--judge-prompt-optimization",
+        action="store_true",
+        help=(
+            "tune the JUDGE PROMPT against held-out human agreement instead of the "
+            "skill (#345 Phase 2 freeze-and-alternate); requires --judge-human-labeled-path"
+        ),
+    )
+    optimize.add_argument(
+        "--judge-human-labeled-path",
+        default="",
+        help="path to a JSON/JSONL held-out human-labeled set (required with --judge-prompt-optimization)",
+    )
+    optimize.add_argument(
+        "--judge-prompt-init",
+        default="",
+        help="initial judge prompt text; defaults to the built-in verdict judge prompt",
+    )
+    optimize.add_argument(
+        "--judge-prompt-version",
+        default="v0",
+        help="base judge prompt version tag stamped on accepted variants",
+    )
+    optimize.add_argument(
+        "--judge-edit-budget",
+        type=int,
+        default=4,
+        help="maximum edits per judge-prompt reflect pass",
+    )
     optimize.set_defaults(func=_run_optimize)
 
     return parser
@@ -201,7 +230,41 @@ def _retry_optimizer_views(value: str) -> str:
     return str(parsed)
 
 
+def _run_judge_optimize(args: argparse.Namespace) -> int:
+    from .judge_optimize import run_judge_optimize
+
+    if not str(args.judge_human_labeled_path).strip():
+        print("error: --judge-prompt-optimization requires --judge-human-labeled-path")
+        return 2
+    result = run_judge_optimize(
+        training_package=args.training_package,
+        out_root=args.out_root,
+        candidate_output=args.candidate_output,
+        human_labeled_path=args.judge_human_labeled_path,
+        judge_prompt_init=args.judge_prompt_init,
+        judge_prompt_version=args.judge_prompt_version,
+        edit_budget=args.judge_edit_budget,
+        optimizer_backend=args.optimizer_backend,
+        optimizer_model=args.optimizer_model,
+        evaluator_id=args.evaluator_id,
+        evaluator_backend=args.evaluator_backend,
+        evaluator_model=args.evaluator_model,
+    )
+    print(f"wrote judge candidate package: {args.candidate_output}")
+    for name, variant in result.get("variants", {}).items():
+        print(
+            f"  variant {name}: n_items={variant['n_items']} "
+            f"baseline_agreement={variant['baseline_agreement']:.3f} "
+            f"best_agreement={variant['best_agreement']:.3f} "
+            f"accepted={variant['accepted']} version={variant['judge_prompt_version']}"
+        )
+    return 0
+
+
 def _run_optimize(args: argparse.Namespace) -> int:
+    if getattr(args, "judge_prompt_optimization", False):
+        return _run_judge_optimize(args)
+
     from .optimize import run_optimize
 
     candidate = run_optimize(

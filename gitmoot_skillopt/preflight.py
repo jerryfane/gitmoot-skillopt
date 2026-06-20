@@ -127,6 +127,63 @@ def run_optimizer_preflight(
     )
 
 
+@dataclass(frozen=True)
+class JudgePreflightResult:
+    optimizer_backend: str
+    evaluator_backend: str
+    optimizer_model: str
+    evaluator_model: str
+    evaluator_config: dict[str, Any]
+
+
+def run_judge_preflight(
+    package: TrainingPackage,
+    *,
+    optimizer_backend: str,
+    optimizer_model: str,
+    evaluator_id: str = "",
+    evaluator_backend: str = "",
+    evaluator_model: str = "",
+) -> JudgePreflightResult:
+    """Preflight for judge-prompt optimization (#345 Phase 2).
+
+    Mirrors :func:`run_optimizer_preflight` but skips the TARGET rollout/render
+    canaries: judge tuning never runs the target agent — it only needs the
+    optimizer (for reflect) and the evaluator (the judge being tuned). The
+    resolved evaluator backend/model are forced onto the returned config so
+    :func:`skillopt.envs.gitmoot.evaluator._chat_evaluator` routes judge calls to
+    the right backend even when the package did not pin one.
+    """
+    resolved_optimizer_backend = _runtime_backend_name(optimizer_backend or "openai_chat")
+    resolved_optimizer_model = str(optimizer_model or default_model_for_backend(resolved_optimizer_backend)).strip()
+    evaluator_config = resolve_evaluator_config(
+        package,
+        evaluator_id=evaluator_id,
+        evaluator_backend=evaluator_backend,
+        evaluator_model=evaluator_model,
+    )
+    resolved_evaluator_backend = _runtime_backend_name(
+        evaluator_config.get("evaluator_backend") or resolved_optimizer_backend
+    )
+    resolved_evaluator_model = str(evaluator_config.get("evaluator_model") or resolved_optimizer_model).strip()
+    evaluator_config["evaluator_backend"] = resolved_evaluator_backend
+    evaluator_config["evaluator_model"] = resolved_evaluator_model
+
+    _require_model("optimizer", resolved_optimizer_model)
+    _require_model("evaluator", resolved_evaluator_model)
+    set_optimizer_backend(resolved_optimizer_backend)
+    set_optimizer_deployment(resolved_optimizer_model)
+    _run_optimizer_canary()
+    _run_evaluator_canary(evaluator_config, resolved_evaluator_backend, resolved_evaluator_model)
+    return JudgePreflightResult(
+        optimizer_backend=resolved_optimizer_backend,
+        evaluator_backend=resolved_evaluator_backend,
+        optimizer_model=resolved_optimizer_model,
+        evaluator_model=resolved_evaluator_model,
+        evaluator_config=evaluator_config,
+    )
+
+
 def _normal_evaluator_id(value: str) -> str:
     normalized = str(value or "").strip().lower().replace("-", "_")
     if normalized in {"judge", "llm", "llmjudge", "manual_judge", "manual_review", "pairwise"}:
