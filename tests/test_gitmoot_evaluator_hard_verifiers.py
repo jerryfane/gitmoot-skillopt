@@ -255,5 +255,128 @@ def test_landing_page_path_unchanged(monkeypatch):
     assert score["failure"]["primary_reason"] == "wrong_artifact_type"
 
 
+# --- review fixes (#346) ---------------------------------------------------
+
+
+def test_deeply_nested_yaml_frontmatter_fails_closed_without_raising(monkeypatch):
+    """Fix 1: an adversarial deeply-nested YAML frontmatter must NOT escape.
+
+    Such content raises RecursionError inside yaml.safe_load; the floor must
+    convert it into a clean hard==0 packet (fail-closed) and never call the judge.
+    """
+    _no_judge(monkeypatch)
+    # '[' * 4000 stays within the size cap but blows the YAML recursion limit.
+    response = "---\n" + ("[" * 4000) + "\n---\n# Update Format\nbody"
+    score = evaluate_response(_agent_template_item(), response, {})
+    assert score["hard"] == 0
+    assert score["soft"] == 0.0
+    failed = _failed_check_ids(score)
+    assert any("frontmatter" in check_id for check_id in failed)
+    # Reason/evidence must name the failure (verifier + error class somewhere).
+    evidence = " ".join(
+        ev for c in score["failure"]["failed_checks"] for ev in c.get("evidence", [])
+    )
+    assert "YAML" in evidence or "Recursion" in evidence or "recursion" in evidence
+
+
+def test_deeply_nested_fenced_json_fails_closed_without_raising(monkeypatch):
+    """Fix 1: adversarial deeply-nested fenced JSON must hard-fail, not raise."""
+    _no_judge(monkeypatch)
+    nested = "[" * 4000  # unterminated deep nesting -> invalid JSON, no escape.
+    response = _GOOD_TEMPLATE + "\n```json\n" + nested + "\n```\n"
+    score = evaluate_response(_agent_template_item(), response, {})
+    assert score["hard"] == 0
+    assert any("fenced_json" in check_id for check_id in _failed_check_ids(score))
+
+
+def test_top_level_guard_converts_any_verifier_crash(monkeypatch):
+    """Fix 1: ANY exception from ANY check is caught fail-closed (hard=0)."""
+    _no_judge(monkeypatch)
+    import skillopt.envs.gitmoot.evaluator as ev
+
+    def crashing(_response):
+        raise RecursionError("simulated verifier crash")
+
+    monkeypatch.setitem(ev._BUILTIN_HARD_CHECKS, "agent_template", crashing)
+    score = evaluate_response(_agent_template_item(), "x" * 200, {})
+    assert score["hard"] == 0
+    failed = score["failure"]["failed_checks"]
+    assert failed
+    evidence = " ".join(ev_ for c in failed for ev_ in c.get("evidence", []))
+    assert "RecursionError" in evidence
+
+
+def test_secret_sk_proj_key_detected(monkeypatch):
+    """Fix 2: OpenAI project keys (sk-proj-...) must be caught."""
+    _no_judge(monkeypatch)
+    response = _GOOD_TEMPLATE + "\nexport OPENAI_API_KEY=sk-proj-T3BlbkFJabcdefghijklmnop0123456789\n"
+    score = evaluate_response(_agent_template_item(), response, {})
+    assert score["hard"] == 0
+    assert any("secret" in check_id for check_id in _failed_check_ids(score))
+
+
+def test_contract_version_float_one_hard_fails(monkeypatch):
+    """Fix 3: a float 1.0 must NOT satisfy the strict int contract_version gate."""
+    _no_judge(monkeypatch)
+    response = json.dumps({"contract_version": 1.0, "templates": []})
+    score = evaluate_response(_package_item(), response, {})
+    assert score["hard"] == 0
+    assert any("contract_version" in check_id for check_id in _failed_check_ids(score))
+
+
+def test_contract_version_int_one_reaches_judge(monkeypatch):
+    """Fix 3: a strict int 1 still passes the contract_version gate."""
+    calls = _stub_judge(monkeypatch)
+    response = json.dumps({"contract_version": 1, "templates": [{"id": "x"}]})
+    score = evaluate_response(_package_item(), response, {})
+    assert calls["count"] == 1
+    assert score["hard"] == 1
+
+
+def test_inline_fenced_json_invalid_hard_fails(monkeypatch):
+    """Fix 4: an inline ```json {...}``` block with invalid JSON must hard-fail."""
+    _no_judge(monkeypatch)
+    response = _GOOD_TEMPLATE + '\n```json {"k": BAD}```\n'
+    score = evaluate_response(_agent_template_item(), response, {})
+    assert score["hard"] == 0
+    assert any("fenced_json" in check_id for check_id in _failed_check_ids(score))
+
+
+def test_inline_fenced_json_valid_reaches_judge(monkeypatch):
+    """Fix 4: a valid inline ```json {...}``` block passes the floor."""
+    calls = _stub_judge(monkeypatch)
+    response = _GOOD_TEMPLATE + '\n```json {"k": 1}```\n'
+    score = evaluate_response(_agent_template_item(), response, {})
+    assert calls["count"] == 1
+    assert score["hard"] == 1
+
+
+def test_newline_fenced_json_still_validated(monkeypatch):
+    """Fix 4: the original newline form is still validated (invalid -> hard fail)."""
+    _no_judge(monkeypatch)
+    response = _GOOD_TEMPLATE + '\n```json\n{"k": BAD}\n```\n'
+    score = evaluate_response(_agent_template_item(), response, {})
+    assert score["hard"] == 0
+    assert any("fenced_json" in check_id for check_id in _failed_check_ids(score))
+
+
+def test_documentation_url_does_not_trigger_absolute_path(monkeypatch):
+    """Fix 5: a documentation URL like https://example.com/home is not a local path."""
+    calls = _stub_judge(monkeypatch)
+    response = _GOOD_TEMPLATE + "\nSee the docs at https://example.com/home for details.\n"
+    score = evaluate_response(_agent_template_item(), response, {})
+    assert calls["count"] == 1
+    assert score["hard"] == 1
+
+
+def test_real_local_secret_path_still_triggers_absolute_path(monkeypatch):
+    """Fix 5: a real machine-local path like /root/.ssh/id_rsa is still flagged."""
+    _no_judge(monkeypatch)
+    response = _GOOD_TEMPLATE + "\nLoad the key from /root/.ssh/id_rsa before running.\n"
+    score = evaluate_response(_agent_template_item(), response, {})
+    assert score["hard"] == 0
+    assert any("absolute_path" in check_id for check_id in _failed_check_ids(score))
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

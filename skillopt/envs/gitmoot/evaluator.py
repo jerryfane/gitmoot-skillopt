@@ -268,20 +268,33 @@ _HARD_VERIFY_MAX_BYTES = 512_000
 # may rename headings, so we match loosely (case-insensitive, any heading level).
 _AGENT_TEMPLATE_REQUIRED_SECTIONS = ("update format",)
 
-# Fenced ```json blocks must parse as JSON.
-_FENCED_JSON_RE = re.compile(r"```json\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
+# Fenced ```json blocks must parse as JSON. The body is captured whether the
+# block is in newline form (```json\n{...}```) or inline form (```json {...}```)
+# so adversarial inline blocks cannot smuggle invalid JSON past the floor.
+_FENCED_JSON_RE = re.compile(r"```json\b[ \t]*\r?\n?(.*?)```", re.DOTALL | re.IGNORECASE)
 
 # Secret-like tokens that must never appear in a candidate template.
 _SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("openai_key", re.compile(r"\bsk-[A-Za-z0-9]{20,}\b")),
+    # ``-``/``_`` are part of the token body so OpenAI project keys
+    # (``sk-proj-...``) and other hyphenated variants are still detected.
+    ("openai_key", re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b")),
     ("aws_access_key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
     ("github_token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b")),
     ("generic_bearer", re.compile(r"(?i)\b(authorization|bearer)\b\s*[:=]\s*[A-Za-z0-9._\-]{16,}")),
     ("private_key_block", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----")),
 )
 
-# Absolute filesystem paths (POSIX home/user roots or Windows drive letters).
-_ABSOLUTE_PATH_RE = re.compile(r"(?:^|[\s\"'(`])(/(?:home|Users|root|var|etc|tmp|usr)/[^\s\"'`)]+|[A-Za-z]:\\\\?[^\s\"'`)]+)")
+# Machine-local absolute filesystem paths (POSIX home/user roots or Windows
+# drive letters). The negative lookbehind ``(?<![:/])`` keeps URL paths such as
+# ``https://example.com/home`` from tripping the check, and each POSIX root must
+# be followed by a ``/<segment>`` so a bare ``/home`` in prose is ignored while a
+# real local path like ``/root/.ssh/id_rsa`` is still flagged.
+_ABSOLUTE_PATH_RE = re.compile(
+    r"(?:^|[\s\"'(`])"
+    r"(?<![:/])"
+    r"(/(?:home|Users|root|var|etc|tmp|usr)/[^\s\"'`)]+"
+    r"|[A-Za-z]:\\\\?[^\s\"'`)]+)"
+)
 
 # Remote-mutation / auto-promote language: instructions that would push, merge,
 # promote, or otherwise mutate remote/shared state without human approval.
@@ -419,12 +432,13 @@ def _hard_check_fenced_json(response: str) -> list[dict[str, Any]]:
             continue
         try:
             json.loads(block)
-        except json.JSONDecodeError as exc:
+        except (json.JSONDecodeError, RecursionError) as exc:
+            detail = getattr(exc, "msg", None) or type(exc).__name__
             failures.append(
                 _failed_check(
                     "hard_verifier.fenced_json",
                     "Fenced ```json example blocks must contain valid JSON.",
-                    [f"json block #{index + 1} did not parse: {exc.msg}"],
+                    [f"json block #{index + 1} did not parse: {detail}"],
                 )
             )
     return failures
@@ -452,13 +466,15 @@ def _hard_checks_agent_template(response: str) -> list[dict[str, Any]]:
     else:
         try:
             parsed = yaml.safe_load(frontmatter)
-        except yaml.YAMLError as exc:
+        except (yaml.YAMLError, RecursionError) as exc:
             parsed = None
+            lines = str(exc).splitlines()
+            detail = lines[0] if lines else type(exc).__name__
             failures.append(
                 _failed_check(
                     "hard_verifier.agent_template.frontmatter",
                     "Agent template frontmatter must be valid YAML.",
-                    [f"frontmatter did not parse as YAML: {str(exc).splitlines()[0]}"],
+                    [f"frontmatter did not parse as YAML: {detail}"],
                 )
             )
         if isinstance(parsed, dict):
@@ -524,9 +540,14 @@ def _hard_checks_package(response: str) -> list[dict[str, Any]]:
         ]
 
     # Replaces judge task_completion/contract conformance: the manifest must
-    # declare the supported contract_version.
+    # declare the supported contract_version. Require a strict int 1 so a float
+    # ``1.0`` (or bool ``True``) does not slip past the version gate.
     contract_version = parsed.get("contract_version")
-    if isinstance(contract_version, bool) or contract_version != 1:
+    if not (
+        isinstance(contract_version, int)
+        and not isinstance(contract_version, bool)
+        and contract_version == 1
+    ):
         failures.append(
             _failed_check(
                 "hard_verifier.package.contract_version",
@@ -584,6 +605,29 @@ def _declared_hard_checks(config: dict[str, Any]) -> list[dict[str, Any]]:
     return [check for check in raw if isinstance(check, dict)]
 
 
+def _safe_run_check(runner: Any, response: str, *, check_name: str) -> list[dict[str, Any]]:
+    """Run a hard-verifier ``runner`` so it can never escape ``evaluate_response``.
+
+    Deterministic checks parse adversarial candidate content (deeply-nested YAML
+    frontmatter or fenced JSON, etc.) that can raise ``RecursionError`` or
+    ``MemoryError`` — exceptions the per-check ``except`` clauses do not catch.
+    Catching ANYTHING here and converting it into a fail-closed failed-check
+    packet keeps the floor's contract intact: a candidate whose content crashes a
+    deterministic verifier is rejected (hard=0), not waved through to the judge.
+    """
+    try:
+        return runner(response)
+    except BaseException as exc:  # noqa: BLE001 - fail-closed on any verifier crash.
+        error_class = type(exc).__name__
+        return [
+            _failed_check(
+                f"hard_verifier.{check_name}",
+                "Candidate crashed a deterministic hard verifier and was rejected (fail-closed).",
+                [f"hard verifier {check_name!r} raised {error_class}"],
+            )
+        ]
+
+
 def _run_hard_verifiers(
     item: dict[str, Any], response: str, config: dict[str, Any]
 ) -> dict[str, Any] | None:
@@ -593,6 +637,10 @@ def _run_hard_verifiers(
     default set keyed by task_kind so the floor is on by default. Returns a
     failure packet (mirroring ``_vue_bundle_failure``) on the first batch of
     failed required checks, else ``None`` (proceed to the normal dispatch).
+
+    Every check runs under ``_safe_run_check`` so no verifier exception (e.g. a
+    ``RecursionError`` from deeply-nested adversarial content) can escape
+    ``evaluate_response``; such crashes fail closed (hard=0).
     """
     task_kind = _judge_task_kind(item, config)
     failed_checks: list[dict[str, Any]] = []
@@ -600,19 +648,18 @@ def _run_hard_verifiers(
     # (a) Built-in default floor keyed by task_kind (on by default).
     builtin = _BUILTIN_HARD_CHECKS.get(task_kind)
     if builtin is not None:
-        failed_checks.extend(builtin(response))
+        failed_checks.extend(_safe_run_check(builtin, response, check_name=task_kind or "builtin"))
 
     # (b) Declared checks from the Go-side evaluator_profile.checks[].
     for check in _declared_hard_checks(config):
         if not bool(check.get("required", True)):
             continue
-        runner = _DECLARED_HARD_CHECKS.get(
-            str(check.get("type") or "").strip()
-        ) or _DECLARED_HARD_CHECKS.get(str(check.get("id") or "").strip())
+        check_type = str(check.get("type") or "").strip()
+        check_id = str(check.get("id") or "").strip()
+        runner = _DECLARED_HARD_CHECKS.get(check_type) or _DECLARED_HARD_CHECKS.get(check_id)
         if runner is None:
             continue
-        for failure in runner(response):
-            check_id = str(check.get("id") or "").strip()
+        for failure in _safe_run_check(runner, response, check_name=check_type or check_id or "declared"):
             if check_id:
                 failure = {**failure, "check": f"{failure.get('check', 'hard_verifier')}[{check_id}]"}
             failed_checks.append(failure)
