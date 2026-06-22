@@ -13,7 +13,13 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
-from skillopt.envs.gitmoot.package import feedback_is_about_previous_outputs, feedback_target_values
+import yaml
+
+from skillopt.envs.gitmoot.package import (
+    feedback_is_about_previous_outputs,
+    feedback_target_values,
+    split_template_document,
+)
 from skillopt.model import chat_optimizer, get_optimizer_backend, set_optimizer_backend, set_optimizer_deployment
 from skillopt.model.common import default_model_for_backend
 from skillopt.utils import extract_json
@@ -205,6 +211,12 @@ def evaluate_response(item: dict[str, Any], response: str, evaluator_config: dic
         return _fixture_score(item)
     if mode in {"contains", "substring"}:
         return _contains_score(item, response, config)
+    # #346: deterministic hard-verifier floor. Runs before the LLM judge (and the
+    # landing-page evaluator) for every non-fixture task kind, short-circuiting on
+    # the first failed required check so the gameable surface stays small.
+    hard_fail = _run_hard_verifiers(item, response, config)
+    if hard_fail is not None:
+        return hard_fail
     inference_config = _landing_page_inference_config(item, config)
     if mode in {LANDING_PAGE_EVALUATOR_ID, "landing-page-v1", "landing_page"} or inference_config is not None:
         if inference_config:
@@ -242,6 +254,374 @@ def _contains_score(item: dict[str, Any], response: str, config: dict[str, Any])
         "fail_reason": "" if ok else f"response did not contain required text {required!r}",
         "metadata": {"evaluator": "contains", "required_text": required},
     }
+
+
+# ---------------------------------------------------------------------------
+# #346: deterministic hard verifiers (default-on floor before the LLM judge)
+# ---------------------------------------------------------------------------
+
+# Reject empty/absurdly-large candidates before running any other check.
+_HARD_VERIFY_MIN_BYTES = 16
+_HARD_VERIFY_MAX_BYTES = 512_000
+
+# Required body sections for an agent-template Markdown document. The optimizer
+# may rename headings, so we match loosely (case-insensitive, any heading level).
+_AGENT_TEMPLATE_REQUIRED_SECTIONS = ("update format",)
+
+# Fenced ```json blocks must parse as JSON.
+_FENCED_JSON_RE = re.compile(r"```json\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
+
+# Secret-like tokens that must never appear in a candidate template.
+_SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("openai_key", re.compile(r"\bsk-[A-Za-z0-9]{20,}\b")),
+    ("aws_access_key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("github_token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b")),
+    ("generic_bearer", re.compile(r"(?i)\b(authorization|bearer)\b\s*[:=]\s*[A-Za-z0-9._\-]{16,}")),
+    ("private_key_block", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----")),
+)
+
+# Absolute filesystem paths (POSIX home/user roots or Windows drive letters).
+_ABSOLUTE_PATH_RE = re.compile(r"(?:^|[\s\"'(`])(/(?:home|Users|root|var|etc|tmp|usr)/[^\s\"'`)]+|[A-Za-z]:\\\\?[^\s\"'`)]+)")
+
+# Remote-mutation / auto-promote language: instructions that would push, merge,
+# promote, or otherwise mutate remote/shared state without human approval.
+_UNSAFE_LANGUAGE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("remote_mutation", re.compile(r"(?i)\b(git\s+push|force[\s-]?push|gh\s+pr\s+merge|git\s+merge\b|push\s+to\s+(?:remote|main|master|origin))\b")),
+    ("auto_promote", re.compile(r"(?i)\bauto[\s-]?(?:promote|merge|approve)\b|\bautomatically\s+(?:promote|merge|approve)\b")),
+)
+
+
+def _hard_verify_failure(
+    failed_checks: list[dict[str, Any]],
+    *,
+    task_kind: str,
+    optimizer_hint: str,
+    primary_reason: str = "hard_verifier_failure",
+) -> dict[str, Any]:
+    """Build a hard-failure packet mirroring ``_vue_bundle_failure``'s shape."""
+    first_reason = (
+        failed_checks[0]["reason"] if failed_checks else "Candidate failed a deterministic hard verifier."
+    )
+    evidence = [item for check in failed_checks for item in check.get("evidence", [])]
+    failure = {
+        "primary_reason": primary_reason,
+        "human_reason": first_reason,
+        "optimizer_hint": optimizer_hint,
+        "failed_dimensions": ["hard_verifier"],
+        "failed_checks": failed_checks,
+        "evidence": evidence,
+        "stage_status": [{"stage": "hard_verifier", "status": "failed"}],
+    }
+    return {
+        "hard": 0,
+        "soft": 0.0,
+        "fail_reason": first_reason,
+        "task_kind": task_kind,
+        "dimension_scores": {"hard_verifier": 0.0},
+        "failure": failure,
+        "primary_reason": primary_reason,
+        "human_reason": first_reason,
+        "optimizer_hint": optimizer_hint,
+        "failed_dimensions": ["hard_verifier"],
+        "failed_checks": failed_checks,
+        "evidence": evidence,
+        "stage_status": failure["stage_status"],
+        "metadata": {
+            "evaluator": "hard_verifier",
+            "task_kind": task_kind,
+            "dimension_scores": {"hard_verifier": 0.0},
+            "failure": failure,
+            "primary_reason": primary_reason,
+            "human_reason": first_reason,
+            "optimizer_hint": optimizer_hint,
+            "failed_dimensions": ["hard_verifier"],
+            "failed_checks": failed_checks,
+            "evidence": evidence,
+            "stage_status": failure["stage_status"],
+        },
+    }
+
+
+def _hard_check_size(response: str) -> list[dict[str, Any]]:
+    """Reject empty/absurdly-large candidates (replaces judge artifact_validity)."""
+    size = len(response.encode("utf-8"))
+    if size < _HARD_VERIFY_MIN_BYTES:
+        return [
+            _failed_check(
+                "hard_verifier.size",
+                "Candidate is empty or too small to be a usable artifact.",
+                [f"candidate was {size} bytes (minimum {_HARD_VERIFY_MIN_BYTES})"],
+            )
+        ]
+    if size > _HARD_VERIFY_MAX_BYTES:
+        return [
+            _failed_check(
+                "hard_verifier.size",
+                "Candidate is implausibly large for the artifact contract.",
+                [f"candidate was {size} bytes (maximum {_HARD_VERIFY_MAX_BYTES})"],
+            )
+        ]
+    return []
+
+
+def _hard_check_no_secrets(response: str) -> list[dict[str, Any]]:
+    """Reject secret-like tokens (replaces judge safety/artifact_validity)."""
+    failures: list[dict[str, Any]] = []
+    for pattern_id, pattern in _SECRET_PATTERNS:
+        match = pattern.search(response)
+        if match is not None:
+            failures.append(
+                _failed_check(
+                    f"hard_verifier.secret.{pattern_id}",
+                    "Candidate must not contain secrets, tokens, or private keys.",
+                    [f"matched secret pattern {pattern_id!r}: {match.group(0)[:24]!r}"],
+                )
+            )
+    return failures
+
+
+def _hard_check_no_absolute_paths(response: str) -> list[dict[str, Any]]:
+    """Reject machine-local absolute paths (replaces judge safety/portability)."""
+    match = _ABSOLUTE_PATH_RE.search(response)
+    if match is None:
+        return []
+    return [
+        _failed_check(
+            "hard_verifier.absolute_path",
+            "Candidate must not embed machine-local absolute filesystem paths.",
+            [f"matched absolute path: {match.group(1)[:80]!r}"],
+        )
+    ]
+
+
+def _hard_check_safe_language(response: str) -> list[dict[str, Any]]:
+    """Reject remote-mutation / auto-promote instructions (replaces judge safety)."""
+    failures: list[dict[str, Any]] = []
+    for pattern_id, pattern in _UNSAFE_LANGUAGE_PATTERNS:
+        match = pattern.search(response)
+        if match is not None:
+            failures.append(
+                _failed_check(
+                    f"hard_verifier.unsafe_language.{pattern_id}",
+                    "Candidate must not instruct remote mutation or auto-promotion without human approval.",
+                    [f"matched unsafe-language pattern {pattern_id!r}: {match.group(0)[:60]!r}"],
+                )
+            )
+    return failures
+
+
+def _hard_check_fenced_json(response: str) -> list[dict[str, Any]]:
+    """Every fenced ```json block must parse (replaces judge artifact_validity)."""
+    failures: list[dict[str, Any]] = []
+    for index, match in enumerate(_FENCED_JSON_RE.finditer(response)):
+        block = match.group(1).strip()
+        if not block:
+            continue
+        try:
+            json.loads(block)
+        except json.JSONDecodeError as exc:
+            failures.append(
+                _failed_check(
+                    "hard_verifier.fenced_json",
+                    "Fenced ```json example blocks must contain valid JSON.",
+                    [f"json block #{index + 1} did not parse: {exc.msg}"],
+                )
+            )
+    return failures
+
+
+def _hard_checks_agent_template(response: str) -> list[dict[str, Any]]:
+    """Built-in default floor for agent_template (Markdown) candidates."""
+    failures: list[dict[str, Any]] = []
+    failures.extend(_hard_check_size(response))
+    if failures:
+        return failures
+
+    document = split_template_document(response)
+    frontmatter = document.frontmatter.strip()
+    if not frontmatter:
+        # Replaces judge artifact_validity: a template with no frontmatter cannot
+        # be parsed/installed by the gitmoot Go side.
+        failures.append(
+            _failed_check(
+                "hard_verifier.agent_template.frontmatter",
+                "Agent template must begin with a non-empty YAML frontmatter block.",
+                ["no '---' delimited YAML frontmatter found"],
+            )
+        )
+    else:
+        try:
+            parsed = yaml.safe_load(frontmatter)
+        except yaml.YAMLError as exc:
+            parsed = None
+            failures.append(
+                _failed_check(
+                    "hard_verifier.agent_template.frontmatter",
+                    "Agent template frontmatter must be valid YAML.",
+                    [f"frontmatter did not parse as YAML: {str(exc).splitlines()[0]}"],
+                )
+            )
+        if isinstance(parsed, dict):
+            for key in ("id", "name", "kind"):
+                value = parsed.get(key)
+                if not isinstance(value, str) or not value.strip():
+                    failures.append(
+                        _failed_check(
+                            "hard_verifier.agent_template.frontmatter",
+                            f"Agent template frontmatter must declare a non-empty {key}.",
+                            [f"frontmatter missing required key {key!r}"],
+                        )
+                    )
+        elif parsed is not None:
+            failures.append(
+                _failed_check(
+                    "hard_verifier.agent_template.frontmatter",
+                    "Agent template frontmatter must be a YAML mapping.",
+                    [f"frontmatter parsed as {type(parsed).__name__}, not a mapping"],
+                )
+            )
+
+    # Replaces judge task_completion: a usable template carries its update format.
+    lowered_body = document.body.lower()
+    for section in _AGENT_TEMPLATE_REQUIRED_SECTIONS:
+        if section not in lowered_body:
+            failures.append(
+                _failed_check(
+                    "hard_verifier.agent_template.sections",
+                    f"Agent template body must include a {section!r} section.",
+                    [f"required section {section!r} not found in body"],
+                )
+            )
+
+    failures.extend(_hard_check_fenced_json(response))
+    failures.extend(_hard_check_no_secrets(response))
+    failures.extend(_hard_check_no_absolute_paths(response))
+    failures.extend(_hard_check_safe_language(response))
+    return failures
+
+
+def _hard_checks_package(response: str) -> list[dict[str, Any]]:
+    """Built-in default floor for package (JSON contract) candidates."""
+    failures: list[dict[str, Any]] = []
+    failures.extend(_hard_check_size(response))
+    if failures:
+        return failures
+
+    # Replaces judge artifact_validity: a package artifact must be valid JSON.
+    parsed = extract_json(response)
+    if parsed is None:
+        try:
+            parsed = json.loads(response)
+        except json.JSONDecodeError:
+            parsed = None
+    if not isinstance(parsed, dict):
+        return [
+            _failed_check(
+                "hard_verifier.package.json",
+                "Package candidate must be a valid JSON object.",
+                ["candidate did not contain a parseable JSON object"],
+            )
+        ]
+
+    # Replaces judge task_completion/contract conformance: the manifest must
+    # declare the supported contract_version.
+    contract_version = parsed.get("contract_version")
+    if isinstance(contract_version, bool) or contract_version != 1:
+        failures.append(
+            _failed_check(
+                "hard_verifier.package.contract_version",
+                "Package candidate must declare contract_version == 1.",
+                [f"contract_version was {contract_version!r}"],
+            )
+        )
+
+    failures.extend(_hard_check_no_secrets(response))
+    failures.extend(_hard_check_no_absolute_paths(response))
+    return failures
+
+
+# Built-in default check set keyed by task_kind. Present here == floor is ON by
+# default with no Go-side config. Returns a list of failed-check dicts.
+_BUILTIN_HARD_CHECKS = {
+    "agent_template": _hard_checks_agent_template,
+    "package": _hard_checks_package,
+}
+
+# Registry of declared-check runners keyed by EvaluatorCheckConfig.type / .id.
+# Lets a Go-side evaluator_profile.checks[] entry opt into a named verifier.
+_DECLARED_HARD_CHECKS = {
+    "agent_template": _hard_checks_agent_template,
+    "agent_template_floor": _hard_checks_agent_template,
+    "package": _hard_checks_package,
+    "package_floor": _hard_checks_package,
+    "no_secrets": _hard_check_no_secrets,
+    "no_absolute_paths": _hard_check_no_absolute_paths,
+    "safe_language": _hard_check_safe_language,
+    "fenced_json": _hard_check_fenced_json,
+    "size": _hard_check_size,
+}
+
+_HARD_VERIFIER_HINTS = {
+    "agent_template": (
+        "Return a valid agent-template Markdown document: open with a non-empty YAML "
+        "frontmatter block declaring id/name/kind, include an Update Format section, keep "
+        "fenced ```json examples valid, and avoid secrets, absolute paths, and remote-mutation "
+        "or auto-promote instructions."
+    ),
+    "package": (
+        "Return a valid JSON package object that declares contract_version: 1 and contains no "
+        "secrets or absolute paths."
+    ),
+    "": "Fix the failed deterministic checks before resubmitting; these are not judged by the LLM.",
+}
+
+
+def _declared_hard_checks(config: dict[str, Any]) -> list[dict[str, Any]]:
+    """Normalize ``config['checks']`` into a list of check-config mappings."""
+    raw = config.get("checks") if isinstance(config, dict) else None
+    if not isinstance(raw, list):
+        return []
+    return [check for check in raw if isinstance(check, dict)]
+
+
+def _run_hard_verifiers(
+    item: dict[str, Any], response: str, config: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Run deterministic hard verifiers before the LLM judge.
+
+    Runs both (a) any checks declared in ``config['checks']`` and (b) a built-in
+    default set keyed by task_kind so the floor is on by default. Returns a
+    failure packet (mirroring ``_vue_bundle_failure``) on the first batch of
+    failed required checks, else ``None`` (proceed to the normal dispatch).
+    """
+    task_kind = _judge_task_kind(item, config)
+    failed_checks: list[dict[str, Any]] = []
+
+    # (a) Built-in default floor keyed by task_kind (on by default).
+    builtin = _BUILTIN_HARD_CHECKS.get(task_kind)
+    if builtin is not None:
+        failed_checks.extend(builtin(response))
+
+    # (b) Declared checks from the Go-side evaluator_profile.checks[].
+    for check in _declared_hard_checks(config):
+        if not bool(check.get("required", True)):
+            continue
+        runner = _DECLARED_HARD_CHECKS.get(
+            str(check.get("type") or "").strip()
+        ) or _DECLARED_HARD_CHECKS.get(str(check.get("id") or "").strip())
+        if runner is None:
+            continue
+        for failure in runner(response):
+            check_id = str(check.get("id") or "").strip()
+            if check_id:
+                failure = {**failure, "check": f"{failure.get('check', 'hard_verifier')}[{check_id}]"}
+            failed_checks.append(failure)
+
+    if not failed_checks:
+        return None
+
+    hint = _HARD_VERIFIER_HINTS.get(task_kind, _HARD_VERIFIER_HINTS[""])
+    return _hard_verify_failure(failed_checks, task_kind=task_kind, optimizer_hint=hint)
 
 
 def _human_feedback_judge_system_prompt() -> str:
