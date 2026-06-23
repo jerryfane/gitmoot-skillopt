@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.3.1
+
+- Default-on deterministic **hard-verifier floor** in the gitmoot evaluator
+  (#346). `evaluate_response` now runs `_run_hard_verifiers` before the LLM
+  judge and short-circuits with a `hard=0` failure packet, shrinking the
+  gameable surface and giving the optimizer crisp, actionable failures.
+  - Built-in checks keyed by `task_kind`: **`agent_template`** (valid YAML
+    frontmatter, required "update format" section, fenced ```json blocks must
+    parse, no secrets / absolute paths / remote-mutation·auto-promote language,
+    size bounds) and **`package`** (valid JSON, strict `contract_version == 1`).
+  - Also honors declared `evaluator_profile.checks`; unknown task kinds with no
+    declared checks are a no-op (behavior unchanged).
+  - **Fail-closed:** every check runs under a guard that converts any crash
+    (e.g. `RecursionError` from adversarial deeply-nested YAML/JSON) into a
+    clean `hard=0` failure instead of taking down the evaluator.
+
 ## v0.3.0
 
 - Wire judge-prompt optimization end-to-end (#345 Phase 2, via #70 + #71). The
