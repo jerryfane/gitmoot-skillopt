@@ -83,6 +83,10 @@ def process_one(
     agent_ok = False
     agent_failed = False
     repair_attempts: list[dict[str, Any]] = []
+    # Per-item token/cost capture: the agent path (exec or chat) populates this
+    # sink so usage/cost lands in result.json for downstream per-item artifacts
+    # (e.g. the #77a live-pairwise review packet). Empty when usage is unknown.
+    exec_usage: dict[str, Any] = {}
 
     try:
         config = evaluator_config if evaluator_config is not None else item.get("evaluator_config")
@@ -94,6 +98,7 @@ def process_one(
             max_completion_tokens,
             pred_dir,
             config=config,
+            usage_sink=exec_usage,
         )
         agent_ok = True
     except Exception as exc:  # noqa: BLE001 - rollout result records the failure.
@@ -139,6 +144,7 @@ def process_one(
                         max_completion_tokens,
                         pred_dir,
                         config=config,
+                        usage_sink=exec_usage,
                     )
                 except Exception as repair_exc:  # noqa: BLE001 - keep the last scored artifact failure.
                     repair_record["status"] = "target_failed"
@@ -198,6 +204,7 @@ def process_one(
         "evaluator_trace_path": score.get("evaluator_trace_path", ""),
         "target_system_prompt": system_prompt,
         "target_user_prompt": user_prompt,
+        "token_usage": dict(exec_usage),
     }
     for key in STRUCTURED_EVALUATOR_FIELDS:
         if key in score:
@@ -303,12 +310,15 @@ def _run_agent(
     pred_dir: str,
     *,
     config: Any = None,
+    usage_sink: dict[str, Any] | None = None,
 ) -> str:
     metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
     if _has_mock_response(item):
         return str(metadata["mock_response"])
     if is_target_exec_backend():
-        response = _run_exec_agent(item, skill_content, system_prompt, user_prompt, pred_dir, config=config)
+        response = _run_exec_agent(
+            item, skill_content, system_prompt, user_prompt, pred_dir, config=config, usage_sink=usage_sink
+        )
         if not response.strip():
             raise RuntimeError("exec target returned empty response")
         return response
@@ -321,6 +331,8 @@ def _run_agent(
         retries=2,
         stage="gitmoot_rollout",
     )
+    if usage_sink is not None and isinstance(_usage, dict) and _usage:
+        usage_sink["usage"] = _usage
     return response
 
 
@@ -333,19 +345,23 @@ def _call_run_agent(
     pred_dir: str,
     *,
     config: Any = None,
+    usage_sink: dict[str, Any] | None = None,
 ) -> str:
     parameters = inspect.signature(_run_agent).parameters
+    kwargs: dict[str, Any] = {}
     if "config" in parameters:
-        return _run_agent(
-            item,
-            skill_content,
-            system_prompt,
-            user_prompt,
-            max_completion_tokens,
-            pred_dir,
-            config=config,
-        )
-    return _run_agent(item, skill_content, system_prompt, user_prompt, max_completion_tokens, pred_dir)
+        kwargs["config"] = config
+    if "usage_sink" in parameters:
+        kwargs["usage_sink"] = usage_sink
+    return _run_agent(
+        item,
+        skill_content,
+        system_prompt,
+        user_prompt,
+        max_completion_tokens,
+        pred_dir,
+        **kwargs,
+    )
 
 
 def _run_exec_agent(
@@ -356,6 +372,7 @@ def _run_exec_agent(
     pred_dir: str,
     *,
     config: Any = None,
+    usage_sink: dict[str, Any] | None = None,
 ) -> str:
     work_dir = os.path.join(pred_dir, "target_exec")
     skill_md = render_skill_md(
@@ -381,6 +398,8 @@ def _run_exec_agent(
     except Exception as exc:
         _write_target_exec_trace_alias(pred_dir, error=str(exc) or "exec target failed")
         raise
+    if usage_sink is not None:
+        usage_sink.update(_extract_exec_usage(raw))
     _write_target_exec_trace_alias(pred_dir, raw=raw)
     with open(os.path.join(pred_dir, "target_exec_response.txt"), "w", encoding="utf-8") as handle:
         handle.write(response)
@@ -564,6 +583,48 @@ def _write_target_exec_trace_alias(pred_dir: str, raw: str = "", error: str = ""
         content = f"exec target failed before raw trace was captured: {error}"
     with open(alias_path, "w", encoding="utf-8") as handle:
         handle.write(content)
+
+
+def _extract_exec_usage(raw: str) -> dict[str, Any]:
+    """Parse token/cost usage from an exec target's raw trace.
+
+    Handles both exec backends without raising: the Claude Code path emits a
+    JSON object carrying ``total_cost_usd``/``usage``/``num_turns``, while the
+    Codex path emits a plain ``tokens used`` line. Returns an empty dict when no
+    usage signal is present so callers can treat usage as best-effort.
+    """
+    usage: dict[str, Any] = {}
+    if not isinstance(raw, str) or not raw.strip():
+        return usage
+    text = raw.strip()
+    if text.startswith("{"):
+        try:
+            data = json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            data = None
+        if isinstance(data, dict):
+            cost = data.get("total_cost_usd")
+            if isinstance(cost, int | float) and not isinstance(cost, bool):
+                usage["cost_usd"] = float(cost)
+            claude_usage = data.get("usage")
+            if isinstance(claude_usage, dict) and claude_usage:
+                usage["usage"] = claude_usage
+            for key in ("num_turns", "duration_ms"):
+                value = data.get(key)
+                if isinstance(value, int | float) and not isinstance(value, bool):
+                    usage[key] = value
+            if usage:
+                return usage
+    lines = [line.rstrip() for line in raw.splitlines()]
+    for index, line in enumerate(lines):
+        if line.strip() == "tokens used" and index + 1 < len(lines):
+            token_text = lines[index + 1].strip().replace(",", "")
+            try:
+                usage["total_tokens"] = int(token_text)
+            except ValueError:
+                pass
+            break
+    return usage
 
 
 def _has_mock_response(item: dict[str, Any]) -> bool:
