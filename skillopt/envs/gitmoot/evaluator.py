@@ -20,6 +20,7 @@ from skillopt.envs.gitmoot.package import (
     feedback_target_values,
     split_template_document,
 )
+from skillopt.envs.gitmoot.trajectory_digest import DEFAULT_MAX_BYTES, build_trajectory_digest
 from skillopt.model import chat_optimizer, get_optimizer_backend, set_optimizer_backend, set_optimizer_deployment
 from skillopt.model.common import default_model_for_backend
 from skillopt.utils import extract_json
@@ -1472,6 +1473,48 @@ def _resolve_judge_system_prompt(item: dict[str, Any], config: dict[str, Any], d
     return default_fn()
 
 
+def _trajectory_digest_settings(config: dict[str, Any]) -> tuple[bool, int]:
+    """Resolve the (enabled, max_bytes) trajectory-digest knobs from evaluator_config.
+
+    OFF BY DEFAULT. Accepts either a top-level boolean flag
+    (``trace_digest_enabled``) or a ``trace_digest`` value that is a bool or a
+    ``{"enabled": bool, "max_bytes": int}`` mapping. Any malformed value falls
+    back to disabled, so the judge prompt stays byte-identical to today.
+    """
+    if not isinstance(config, dict):
+        return False, DEFAULT_MAX_BYTES
+    enabled = bool(config.get("trace_digest_enabled"))
+    max_bytes = DEFAULT_MAX_BYTES
+    spec = config.get("trace_digest")
+    if isinstance(spec, bool):
+        enabled = enabled or spec
+    elif isinstance(spec, dict):
+        enabled = enabled or bool(spec.get("enabled"))
+        raw_cap = spec.get("max_bytes")
+        try:
+            if raw_cap is not None and int(raw_cap) > 0:
+                max_bytes = int(raw_cap)
+        except (TypeError, ValueError):
+            max_bytes = DEFAULT_MAX_BYTES
+    return enabled, max_bytes
+
+
+def _process_summary_sections(config: dict[str, Any]) -> list[str]:
+    """Return the ``## Process Summary`` prompt section, or ``[]`` when disabled.
+
+    Flag-gated and fail-closed: when the digest is disabled, the prediction dir
+    is missing, the backend is not an exec backend, or the trace is empty/garbage,
+    this returns ``[]`` and the judge prompt is byte-identical to today.
+    """
+    enabled, max_bytes = _trajectory_digest_settings(config)
+    if not enabled:
+        return []
+    digest = build_trajectory_digest(config.get("_prediction_dir"), max_bytes=max_bytes)
+    if not digest:
+        return []
+    return ["## Process Summary", digest]
+
+
 def _judge_score(item: dict[str, Any], response: str, config: dict[str, Any]) -> dict[str, Any]:
     has_feedback = _has_human_feedback(item)
 
@@ -1499,6 +1542,7 @@ def _judge_score(item: dict[str, Any], response: str, config: dict[str, Any]) ->
                 if has_feedback
                 else []
             ),
+            *_process_summary_sections(config),
             "## Candidate Response",
             response,
         ]
