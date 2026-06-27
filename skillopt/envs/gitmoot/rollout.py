@@ -6,6 +6,7 @@ import hashlib
 import inspect
 import json
 import os
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -46,6 +47,7 @@ def run_batch(
     max_completion_tokens: int = 4096,
     evaluator_config: dict[str, Any] | None = None,
     target_artifact_retry_budget: int = 1,
+    skip_evaluation: bool = False,
 ) -> list[dict[str, Any]]:
     return [
         process_one(
@@ -55,6 +57,7 @@ def run_batch(
             max_completion_tokens=max_completion_tokens,
             evaluator_config=evaluator_config,
             target_artifact_retry_budget=target_artifact_retry_budget,
+            skip_evaluation=skip_evaluation,
         )
         for item in items
     ]
@@ -68,6 +71,7 @@ def process_one(
     max_completion_tokens: int = 4096,
     evaluator_config: dict[str, Any] | None = None,
     target_artifact_retry_budget: int = 1,
+    skip_evaluation: bool = False,
 ) -> dict[str, Any]:
     item_id = str(item["id"])
     prediction_id = safe_item_path_segment(item_id)
@@ -114,6 +118,20 @@ def process_one(
             target_trace_path=target_trace_path,
             evaluator_trace_path=evaluator_trace_path,
             metadata={"evaluator": "not_run", "agent_error": True},
+        )
+    elif skip_evaluation:
+        # Response-only rollout (e.g. live-pairwise): the agent response is the
+        # only product, so never invoke the evaluator/judge. This avoids a
+        # per-item LLM-judge call (and its network dependency / spend) for a mode
+        # that discards all hard/soft scores.
+        score = make_unscored_evaluation(
+            fail_reason="",
+            target_status=TARGET_PASSED,
+            evaluator_status=EVALUATOR_NOT_RUN,
+            blocker="",
+            target_trace_path=target_trace_path,
+            evaluator_trace_path=evaluator_trace_path,
+            metadata={"evaluator": "not_run", "evaluation_skipped": True},
         )
     else:
         try:
@@ -585,36 +603,63 @@ def _write_target_exec_trace_alias(pred_dir: str, raw: str = "", error: str = ""
         handle.write(content)
 
 
+def _usage_from_json_blob(text: str) -> dict[str, Any]:
+    """Pull token/cost fields out of a single JSON-looking trace body."""
+    usage: dict[str, Any] = {}
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return usage
+    if not isinstance(data, dict):
+        return usage
+    cost = data.get("total_cost_usd")
+    if isinstance(cost, int | float) and not isinstance(cost, bool):
+        usage["cost_usd"] = float(cost)
+    claude_usage = data.get("usage")
+    if isinstance(claude_usage, dict) and claude_usage:
+        usage["usage"] = claude_usage
+    for key in ("num_turns", "duration_ms"):
+        value = data.get(key)
+        if isinstance(value, int | float) and not isinstance(value, bool):
+            usage[key] = value
+    return usage
+
+
+def _exec_attempt_segments(raw: str) -> list[str]:
+    """Split a raw trace into per-attempt bodies, stripping ``===== ATTEMPT ====`` banners.
+
+    ``run_target_exec`` joins each attempt as ``===== <BACKEND> <CLI|SDK> ATTEMPT N =====\\n<body>``
+    (newline-joined), so the usage JSON never sits at the start of the blob. Strip
+    those banners and return each attempt body so callers can parse them.
+    """
+    banner = re.compile(r"^=====.*ATTEMPT\s+\d+\s+=====\s*$", re.MULTILINE)
+    if not banner.search(raw):
+        return [raw]
+    segments = [segment.strip() for segment in banner.split(raw)]
+    return [segment for segment in segments if segment]
+
+
 def _extract_exec_usage(raw: str) -> dict[str, Any]:
     """Parse token/cost usage from an exec target's raw trace.
 
-    Handles both exec backends without raising: the Claude Code path emits a
-    JSON object carrying ``total_cost_usd``/``usage``/``num_turns``, while the
-    Codex path emits a plain ``tokens used`` line. Returns an empty dict when no
+    Handles both exec backends without raising: the Claude Code / Codex SDK paths
+    emit a JSON object carrying ``total_cost_usd``/``usage``/``num_turns``, while
+    the Codex CLI path emits a plain ``tokens used`` line. ``run_target_exec``
+    wraps every attempt body behind a ``===== ... ATTEMPT N =====`` banner, so we
+    strip those banners and parse each attempt, keeping the last attempt that
+    carries usage (the returned/successful one). Returns an empty dict when no
     usage signal is present so callers can treat usage as best-effort.
     """
     usage: dict[str, Any] = {}
     if not isinstance(raw, str) or not raw.strip():
         return usage
-    text = raw.strip()
-    if text.startswith("{"):
-        try:
-            data = json.loads(text)
-        except (json.JSONDecodeError, ValueError):
-            data = None
-        if isinstance(data, dict):
-            cost = data.get("total_cost_usd")
-            if isinstance(cost, int | float) and not isinstance(cost, bool):
-                usage["cost_usd"] = float(cost)
-            claude_usage = data.get("usage")
-            if isinstance(claude_usage, dict) and claude_usage:
-                usage["usage"] = claude_usage
-            for key in ("num_turns", "duration_ms"):
-                value = data.get(key)
-                if isinstance(value, int | float) and not isinstance(value, bool):
-                    usage[key] = value
-            if usage:
-                return usage
+    for segment in _exec_attempt_segments(raw):
+        if segment.startswith("{"):
+            segment_usage = _usage_from_json_blob(segment)
+            if segment_usage:
+                usage = segment_usage
+    if usage:
+        return usage
     lines = [line.rstrip() for line in raw.splitlines()]
     for index, line in enumerate(lines):
         if line.strip() == "tokens used" and index + 1 < len(lines):

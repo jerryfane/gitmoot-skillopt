@@ -58,13 +58,30 @@ def _write_multi_val_package(tmp_path):
 def test_blinded_packet_hides_champion_mapping():
     ids = [f"item-{n}" for n in range(8)]
     items = _val_items(ids)
+    # Feed role-revealing rollout-scoped trace paths on every side, exactly as a
+    # real run does (out_root/rollout/promoted|candidate/...): the blinded packet
+    # must NOT echo these back or it trivially unblinds the champion.
+    promoted = _results(
+        ids,
+        "alpha",
+        target_trace_path="/abs/out/rollout/promoted/predictions/x/target_exec_raw.txt",
+    )
+    candidate = _results(
+        ids,
+        "beta",
+        target_trace_path="/abs/out/rollout/candidate/predictions/x/target_exec_raw.txt",
+    )
+    # Drop one side for one item so the missing-side fallback path is exercised:
+    # its fail_reason must stay role-neutral (no "promoted"/"candidate").
+    promoted.pop("item-3")
+
     packet, secret_map = build_pairwise_packet(
         run_id="run-1",
         template_id="planner",
         base_version_id="planner@v1",
         items=items,
-        promoted_results=_results(ids, "alpha"),
-        candidate_results=_results(ids, "beta"),
+        promoted_results=promoted,
+        candidate_results=candidate,
         seed=7,
         promoted_content="promoted body",
         candidate_content="candidate body",
@@ -77,6 +94,14 @@ def test_blinded_packet_hides_champion_mapping():
     for word in _ROLE_LEAK_WORDS:
         assert word not in markdown.lower()
         assert word not in packet_json.lower()
+
+    # The rollout-scoped trace path (which encodes the role dir) never appears in
+    # the packet; it is recorded only in the secret map.
+    assert "/rollout/" not in packet_json
+    assert "target_trace_path" not in packet_json
+    secret_json = json.dumps(secret_map)
+    assert "/rollout/promoted/" in secret_json
+    assert "/rollout/candidate/" in secret_json
 
     # Per-output entries are labeled only A/B; nothing names the role.
     for packet_item in packet["items"]:
@@ -91,7 +116,11 @@ def test_blinded_packet_hides_champion_mapping():
     # so position alone cannot reveal the champion.
     champion_labels = {entry["champion_label"] for entry in secret_map["items"]}
     assert champion_labels == {"A", "B"}
-    a_outputs = {item["outputs"][0]["response"].split("-")[0] for item in packet["items"]}
+    a_outputs = {
+        item["outputs"][0]["response"].split("-")[0]
+        for item in packet["items"]
+        if item["outputs"][0]["response"]
+    }
     assert a_outputs == {"alpha", "beta"}
 
 
@@ -291,9 +320,12 @@ def test_cli_pairwise_invocation_writes_packet(tmp_path, monkeypatch, capsys):
 def test_process_one_threads_exec_token_and_cost(tmp_path, monkeypatch):
     from skillopt.envs.gitmoot import rollout
 
-    claude_raw = json.dumps(
+    # run_target_exec wraps each attempt body behind a "===== ... ATTEMPT N ====="
+    # banner, so usage parsing must survive the banner (not require a bare JSON).
+    claude_json = json.dumps(
         {"total_cost_usd": 0.0123, "usage": {"input_tokens": 10, "output_tokens": 5}, "num_turns": 2}
     )
+    claude_raw = f"===== CLAUDE SDK ATTEMPT 1 =====\n{claude_json}"
 
     def fake_exec(**kwargs):
         return "exec response", claude_raw

@@ -166,8 +166,8 @@ def build_pairwise_packet(
 
     for item in items:
         item_id = str(item["id"])
-        promoted_result = promoted_results.get(item_id) or _missing_side_result(item_id, "promoted")
-        candidate_result = candidate_results.get(item_id) or _missing_side_result(item_id, "candidate")
+        promoted_result = promoted_results.get(item_id) or _missing_side_result(item_id)
+        candidate_result = candidate_results.get(item_id) or _missing_side_result(item_id)
         champion_is_a = rng.random() < 0.5
 
         if champion_is_a:
@@ -196,6 +196,9 @@ def build_pairwise_packet(
                     (SIDE_A if champion_is_a else SIDE_B): "promoted",
                     (SIDE_B if champion_is_a else SIDE_A): "candidate",
                 },
+                # Role-revealing trace paths live ONLY here, never in the packet.
+                "promoted_trace_path": str(promoted_result.get("target_trace_path") or ""),
+                "candidate_trace_path": str(candidate_result.get("target_trace_path") or ""),
             }
         )
 
@@ -350,6 +353,9 @@ def _blinded_side(label: str, result: dict[str, Any]) -> dict[str, Any]:
     fail_reason = str(result.get("fail_reason") or "")
     failed = bool(result.get("agent_ok") is False or target_status == "failed" or result.get("agent_error"))
     token_usage = result.get("token_usage") if isinstance(result.get("token_usage"), dict) else {}
+    # NOTE: never copy role/filesystem-derived fields (e.g. ``target_trace_path``,
+    # which encodes the ``promoted``/``candidate`` rollout dir) into the blinded
+    # side. Doing so would unblind the champion. Those live only in the secret map.
     return {
         "label": label,
         "response": str(result.get("response") or ""),
@@ -360,19 +366,19 @@ def _blinded_side(label: str, result: dict[str, Any]) -> dict[str, Any]:
         "runtime": {
             "n_turns": result.get("n_turns"),
             "blocker": str(result.get("blocker") or ""),
-            "target_trace_path": str(result.get("target_trace_path") or ""),
         },
     }
 
 
-def _missing_side_result(item_id: str, role: str) -> dict[str, Any]:
+def _missing_side_result(item_id: str) -> dict[str, Any]:
+    # fail_reason is surfaced in the blinded packet, so it must stay role-neutral.
     return {
         "id": item_id,
         "response": "",
         "agent_ok": False,
         "agent_error": True,
         "target_status": "failed",
-        "fail_reason": f"live {role} rollout produced no result for this item",
+        "fail_reason": "live rollout produced no result for this item",
         "blocker": "pairwise_side_missing",
         "token_usage": {},
     }
@@ -396,10 +402,13 @@ def _safe_run_batch(
 ) -> list[dict[str, Any]]:
     """Run one side's live rollout, fail-closed per item.
 
-    ``run_batch``/``process_one`` already capture per-item agent and evaluator
-    failures as structured unscored results. If the whole batch raises before
-    returning (a catastrophic side failure), degrade to per-item failure results
-    so one bad live run never aborts the pairwise packet.
+    Runs response-only (``skip_evaluation=True``): the blinded packet uses only
+    the agent response/usage/agent_ok, never the hard/soft scores, so we never
+    invoke the per-item evaluator/judge (avoiding needless LLM/jury spend and a
+    network-dependent failure surface). ``process_one`` still captures per-item
+    agent failures as structured unscored results. If the whole batch raises
+    before returning (a catastrophic side failure), degrade to per-item failure
+    results so one bad live run never aborts the pairwise packet.
     """
     try:
         return run_batch(
@@ -408,6 +417,7 @@ def _safe_run_batch(
             out_root=out_root,
             evaluator_config=evaluator_config,
             max_completion_tokens=max_completion_tokens,
+            skip_evaluation=True,
         )
     except Exception as exc:  # noqa: BLE001 - fail-closed: record, do not abort.
         reason = str(exc) or "live rollout batch failed"
