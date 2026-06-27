@@ -667,7 +667,7 @@ def _run_claude_code_cli_exec(
         str(config["path"]),
         "-p",
         "--output-format",
-        "text",
+        "json",
         "--permission-mode",
         permission_mode or "bypassPermissions",
         "--add-dir",
@@ -716,10 +716,30 @@ def _run_claude_code_cli_exec(
     raw = stdout
     if stderr:
         raw = f"{raw}\n[stderr]\n{stderr}" if raw else stderr
-    response = stdout.strip()
+    # ``--output-format json`` yields a result envelope carrying the response text
+    # in ``result`` plus ``total_cost_usd``/``usage``/``num_turns`` (which
+    # ``_extract_exec_usage`` reads from the raw trace). Parse defensively and
+    # fall back to the plain stdout if the envelope is missing/unparseable.
+    response = _claude_cli_response_from_json(stdout)
     if proc.returncode != 0 and not response:
         return "", raw
     return response, raw
+
+
+def _claude_cli_response_from_json(stdout: str) -> str:
+    text = (stdout or "").strip()
+    if not text:
+        return ""
+    if text.startswith("{"):
+        try:
+            data = json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            data = None
+        if isinstance(data, dict):
+            result = data.get("result")
+            if isinstance(result, str):
+                return result.strip()
+    return text
 
 
 def run_claude_code_exec(

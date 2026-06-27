@@ -204,6 +204,73 @@ def build_parser() -> argparse.ArgumentParser:
     )
     optimize.set_defaults(func=_run_optimize)
 
+    pairwise = subcommands.add_parser(
+        "pairwise",
+        help="opt-in live-pairwise eval: rerun promoted + candidate live and emit a blinded review packet",
+        description=(
+            "Opt-in live-pairwise evaluation (#77a). Reruns BOTH the promoted "
+            "template and the candidate template live over the validation split, "
+            "then writes a blinded paired review packet plus per-item artifacts "
+            "(both outputs, token/cost, runtime metadata, and per-item failures). "
+            "Does not run the optimizer rewrite or the score-gate, never promotes, "
+            "and never writes ~/.gitmoot. The default saved-baseline 'optimize' "
+            "path is unchanged."
+        ),
+    )
+    pairwise.add_argument(
+        "--training-package",
+        required=True,
+        help="path to a Gitmoot skillopt training package JSON file",
+    )
+    pairwise.add_argument(
+        "--artifact-root",
+        required=True,
+        help="path to Gitmoot's content-addressed artifact blob root",
+    )
+    pairwise.add_argument(
+        "--candidate",
+        required=True,
+        help=(
+            "candidate template to compare: a template markdown file, a candidate "
+            "package JSON, or an optimizer run directory containing best_skill.md"
+        ),
+    )
+    pairwise.add_argument(
+        "--out-root",
+        required=True,
+        help="directory for live-pairwise run output",
+    )
+    pairwise.add_argument(
+        "--candidate-output",
+        default="",
+        help="ignored placeholder kept for flag parity with optimize; pairwise never emits a candidate package",
+    )
+    pairwise.add_argument(
+        "--artifact-dir",
+        default="",
+        help="directory where review packet artifacts should be written; defaults to OUT_ROOT/artifacts",
+    )
+    pairwise.add_argument(
+        "--mode",
+        default="live-pairwise",
+        choices=["live-pairwise"],
+        help="pairwise evaluation mode (only live-pairwise is supported)",
+    )
+    pairwise.add_argument("--seed", type=int, default=42, help="random seed for split and A/B blinding")
+    pairwise.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="optional cap on validation items per side (0 = all)",
+    )
+    pairwise.add_argument(
+        "--max-completion-tokens",
+        type=int,
+        default=4096,
+        help="max completion tokens for chat-target live rollouts",
+    )
+    pairwise.set_defaults(func=_run_pairwise)
+
     return parser
 
 
@@ -344,6 +411,27 @@ def _run_optimize(args: argparse.Namespace) -> int:
         print(f"next_action: {metadata.get('next_action')}")
     else:
         print(f"wrote candidate package: {args.candidate_output}")
+    return 0
+
+
+def _run_pairwise(args: argparse.Namespace) -> int:
+    from .pairwise import run_pairwise_eval
+
+    summary = run_pairwise_eval(
+        training_package=args.training_package,
+        artifact_root=args.artifact_root,
+        candidate=args.candidate,
+        out_root=args.out_root,
+        artifact_dir=args.artifact_dir,
+        seed=args.seed,
+        max_completion_tokens=args.max_completion_tokens,
+        limit=args.limit,
+        mode=args.mode,
+    )
+    print(f"wrote live-pairwise review packet: {summary['packet_markdown_path']}")
+    print(f"packet json: {summary['packet_json_path']}")
+    print(f"secret map (admin/debug, separate): {summary['secret_map_path']}")
+    print(f"val items: {summary['item_count']} failed_sides: {summary['failed_sides']}")
     return 0
 
 
