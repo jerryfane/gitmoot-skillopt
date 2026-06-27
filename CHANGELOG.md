@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.4.0
+
+- **Trajectory digest for the judge** (#348 Phase 1). A budgeted, secrets-redacted
+  `TrajectoryDigest` (reusing the previously-unused `parse_codex_raw`) is injected
+  into the gitmoot judge prompt as a `## Process Summary` section, so the judge can
+  see *what the agent did* (tool calls, commands, tests + outcomes, files touched,
+  retries/errors) — not only the final artifact. **Off by default** (judge prompt
+  byte-identical until enabled via `evaluator_config`), exec-backends only,
+  fail-closed on any missing/garbage trace, no contract bump, no raw chain-of-thought.
+- **Live-pairwise evaluation mode** (#77a). New opt-in `live-pairwise` mode reruns
+  both the promoted and candidate templates live over the validation set and emits a
+  **blinded paired review packet** (the secret A/B map kept in a separate artifact) +
+  per-item token/cost/failure artifacts. No optimizer rewrite, no score-gate, manual
+  promotion, additive contract; the default saved-baseline path is unchanged. The Go
+  side ingests the blinded packet into canonical feedback events (gitmoot #508).
+
 ## v0.3.1
 
 - Default-on deterministic **hard-verifier floor** in the gitmoot evaluator
