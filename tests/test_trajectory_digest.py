@@ -176,6 +176,36 @@ def test_redaction_covers_kv_credentials():
     assert "supersecretvalue12345" not in digest
 
 
+def test_redaction_covers_compound_env_var_names():
+    # The dominant real-world shape: a sensitive word inside an underscore
+    # compound identifier (no clean leading word boundary).
+    secrets = {
+        "AWS_SECRET_ACCESS_KEY": "wJalrXUtnFEMIsecretvalue0123456789abcdef",
+        "GITHUB_TOKEN": "hunter2plainvalue",
+        "DATABASE_PASSWORD": "p4ssw0rdplainvalue",
+        "MY_REFRESH_TOKEN": "refreshplainvalue42",
+    }
+    body = "\n".join(
+        f"\nexec\nbash -lc 'export {name}={value}'\nsucceeded in 0.01s"
+        for name, value in secrets.items()
+    )
+    digest = build_trajectory_digest_from(REALISTIC_RAW + body)
+    for name, value in secrets.items():
+        assert value not in digest, f"{name} value leaked"
+
+
+def test_redaction_covers_basic_auth_scheme_credential():
+    # Two-token auth header: the base64 credential after the scheme word must
+    # be redacted, not just the scheme word.
+    cred = "dXNlcjpzdXBlcnNlY3JldA=="
+    raw = REALISTIC_RAW + (
+        f"\nexec\nbash -lc 'curl -H \"Authorization: Basic {cred}\" https://api.example.com'"
+        "\nsucceeded in 0.01s\n"
+    )
+    digest = build_trajectory_digest_from(raw)
+    assert cred not in digest
+
+
 # --- cap enforcement ------------------------------------------------------------
 
 

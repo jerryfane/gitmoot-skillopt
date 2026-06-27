@@ -30,6 +30,11 @@ from skillopt.model.codex_harness import parse_codex_raw
 # ~3k tokens of budget for the digest body (a conservative slice of the ~4k cap).
 DEFAULT_MAX_BYTES = 12000
 
+# Hard ceiling on how much raw trace we materialize before any cap runs, so a
+# pathological multi-hundred-MB raw file cannot be fully read into memory. Far
+# larger than any sane digest budget, so it never truncates a real trace.
+_MAX_RAW_CHARS = 8_000_000
+
 _REDACTED = "[REDACTED]"
 
 # Exec-backend raw trace files, in preference order. ``target_exec_raw.txt`` is
@@ -46,17 +51,24 @@ _SECRET_PATTERNS = (
     re.compile(r"AKIA[0-9A-Z]{16}"),
     re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}"),
     re.compile(r"eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"),
-    re.compile(r"(?i)bearer\s+[A-Za-z0-9._\-]{10,}"),
+    # Scheme-aware auth credentials: redact the token after the scheme word so
+    # two-token headers like ``Authorization: Basic <base64-cred>`` do not leak
+    # the credential (only the scheme word would otherwise be caught by _KV_SECRET).
+    re.compile(r"(?i)(?:bearer|basic|token|digest)\s+[A-Za-z0-9._\-=/+]{8,}"),
     re.compile(
         r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"
     ),
 )
 
 # ``key=value`` / ``key: value`` credential assignments -> keep the key, drop the value.
+# The key match covers identifiers that merely CONTAIN a sensitive word so compound
+# env-var names (AWS_SECRET_ACCESS_KEY, GITHUB_TOKEN, DATABASE_PASSWORD,
+# MY_REFRESH_TOKEN) are redacted, not just clean-boundary names like API_KEY.
 _KV_SECRET = re.compile(
-    r"(?i)\b(authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|"
-    r"secret[_-]?key|client[_-]?secret|private[_-]?key|password|passwd|pwd|"
-    r"token|secret|apikey)\b(\s*[:=]\s*)[\"']?[^\s\"'`]+"
+    r"(?i)\b([A-Za-z0-9_-]*"
+    r"(?:authorization|token|secret|password|passwd|pwd|api[_-]?key|apikey|"
+    r"credential|auth)"
+    r"[A-Za-z0-9_-]*)(\s*[:=]\s*)[\"']?[^\s\"'`]+"
 )
 
 _TEST_CMD = re.compile(
@@ -118,7 +130,7 @@ def _read_exec_raw(prediction_dir: str | None) -> str:
         path = os.path.join(pred, name)
         if os.path.isfile(path):
             with open(path, encoding="utf-8", errors="replace") as handle:
-                return handle.read()
+                return handle.read(_MAX_RAW_CHARS)
     return ""
 
 
@@ -130,7 +142,10 @@ def _render(steps: list[dict]) -> str:
     files: list[str] = []
     seen_files: set[str] = set()
     error_lines: list[str] = []
+    seen_errors: set[str] = set()
+    error_line_count = 0
     violations: list[str] = []
+    seen_violations: set[str] = set()
     failed_commands = 0
     total_seconds = 0.0
     last_codex_message = ""
@@ -148,8 +163,13 @@ def _render(steps: list[dict]) -> str:
                 files.append(f"{match.group(1).lower()}: {path}")
 
         for hint in _VIOLATION_HINT.finditer(content):
+            if len(violations) >= _MAX_VIOLATIONS:
+                break
             line = _line_of(content, hint.start())
-            if line and line not in violations:
+            # Bound collection (not just the render slice) and use a set for O(1)
+            # dedup so a verbose trace cannot drive O(n^2) membership scans.
+            if line and line not in seen_violations:
+                seen_violations.add(line)
                 violations.append(line)
 
         if stype == "exec":
@@ -165,7 +185,14 @@ def _render(steps: list[dict]) -> str:
                 low = line.lower()
                 if "error" in low or "traceback" in low or "exception" in low:
                     stripped = line.strip()
-                    if stripped and stripped not in error_lines:
+                    if not stripped:
+                        continue
+                    error_line_count += 1
+                    # Bound the distinct-line collection and use a set for O(1)
+                    # dedup; a huge failing log cannot drive O(n^2) scans or grow
+                    # the stored list without limit (the count metric stays exact).
+                    if len(error_lines) < _MAX_ERRORS and stripped not in seen_errors:
+                        seen_errors.add(stripped)
                         error_lines.append(stripped)
         elif stype == "codex":
             text = " ".join(part.strip() for part in content.splitlines() if part.strip())
@@ -216,7 +243,7 @@ def _render(steps: list[dict]) -> str:
     out.append("")
     out.append("### Errors / retries / recovery")
     out.append(f"- failed commands: {failed_commands}")
-    out.append(f"- error lines observed: {len(error_lines)}")
+    out.append(f"- error lines observed: {error_line_count}")
     out.append(f"- recovery: {_recovery_note(commands, failed_commands)}")
     for line in error_lines[:_MAX_ERRORS]:
         out.append(f"- {_clip(line, _CMD_CHARS)}")
