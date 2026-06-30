@@ -11,7 +11,31 @@ from gitmoot_skillopt.contracts import (
     ContractError,
     TrainingPackage,
 )
-from skillopt.envs.gitmoot.package import feedback_is_about_previous_outputs
+from skillopt.envs.gitmoot.package import (
+    feedback_is_about_previous_outputs,
+    safe_item_path_segment,
+)
+
+
+def test_safe_item_path_segment_passes_already_safe_ids():
+    assert safe_item_path_segment("item-001") == "item-001"
+    assert safe_item_path_segment("release_plan.v2") == "release_plan.v2"
+
+
+def test_safe_item_path_segment_sanitizes_mode_a_pr_ref_item_ids():
+    # Mode A trace harvesting (#465) uses a gitmoot PR ref like 'owner/repo#5'
+    # as the item id; it must be sanitized into a safe path segment, not rejected.
+    a = safe_item_path_segment("jerryfane/noted#5")
+    b = safe_item_path_segment("jerryfane/noted#6")
+    assert "/" not in a and "\\" not in a
+    assert a not in {".", ".."}
+    assert a != b  # distinct ids must not collide into the same directory
+    assert safe_item_path_segment("jerryfane/noted#5") == a  # deterministic
+
+
+def test_safe_item_path_segment_still_requires_nonempty():
+    with pytest.raises(ValueError):
+        safe_item_path_segment("   ")
 
 
 def template_content(template_id: str = "planner", name: str = "Planner") -> str:
