@@ -18,7 +18,7 @@ _TEMPLATE_ID_RE = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
 _TEMPLATE_KIND = "agent-template"
 _TEMPLATE_VERSION = 1
 _VALID_CAPABILITIES = {"ask", "review", "implement"}
-_VALID_RUNTIMES = {"codex", "claude", "shell"}
+_VALID_RUNTIMES = {"codex", "claude", "kimi", "shell"}
 _ARTIFACT_REF_FIELDS = (
     "source_artifact_id",
     "baseline_artifact_id",

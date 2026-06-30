@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.4.1
+
+- **Fix: accept the `kimi` runtime in template `runtime_compatibility`.** gitmoot
+  added Kimi Code as a supported runtime and its default agent-template scaffold
+  lists `kimi`, but the contract validator's `_VALID_RUNTIMES` whitelist only had
+  `codex`/`claude`/`shell` — so the optimizer crashed with
+  `ContractError: template frontmatter has invalid runtime_compatibility 'kimi'`
+  on any real gitmoot template that declares kimi compatibility. Added `kimi` to
+  the whitelist. Found by a live end-to-end codex optimization run.
+
 ## v0.4.0
 
 - **Trajectory digest for the judge** (#348 Phase 1). A budgeted, secrets-redacted
