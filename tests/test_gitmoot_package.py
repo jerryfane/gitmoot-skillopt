@@ -213,6 +213,23 @@ def test_training_package_loads_and_round_trips(tmp_path):
     assert loaded.ranked_feedback_events[0].required_improvements == ["better mobile layout", "stronger product visuals"]
 
 
+def test_training_package_accepts_kimi_runtime_compatibility():
+    # gitmoot supports the Kimi runtime, and its default agent-template scaffold
+    # lists `kimi` in runtime_compatibility — so the optimizer must accept it,
+    # not crash validating a real gitmoot template package.
+    data = training_package_dict()
+    data["template"]["metadata"]["runtime_compatibility"] = ["codex", "claude", "kimi"]
+    package = TrainingPackage.from_dict(data)
+    assert package.template.metadata["runtime_compatibility"] == ["codex", "claude", "kimi"]
+
+
+def test_training_package_rejects_unknown_runtime_compatibility():
+    data = training_package_dict()
+    data["template"]["metadata"]["runtime_compatibility"] = ["bogus"]
+    with pytest.raises(ContractError, match="invalid runtime_compatibility"):
+        TrainingPackage.from_dict(data)
+
+
 def test_training_package_evaluator_profile_round_trips():
     data = training_package_dict()
     data["evaluator_profile"] = {
