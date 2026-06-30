@@ -560,7 +560,13 @@ def test_dataloader_rejects_unsupported_artifact_driver(tmp_path):
         loader.setup({})
 
 
-def test_dataloader_rejects_item_ids_that_are_unsafe_paths(tmp_path):
+def test_dataloader_sanitizes_unsafe_path_item_ids(tmp_path):
+    # An unsafe item id (here a path-traversal attempt; Mode A also produces
+    # PR-ref ids like 'owner/repo#5') is now sanitized into a contained, safe
+    # path segment rather than rejected — so setup() succeeds and no traversal
+    # escapes the per-item directory.
+    from skillopt.envs.gitmoot.package import safe_item_path_segment
+
     package_path, artifact_root = write_training_package(tmp_path)
     package = json.loads(package_path.read_text(encoding="utf-8"))
     package["items"][0]["id"] = "../escape"
@@ -569,5 +575,8 @@ def test_dataloader_rejects_item_ids_that_are_unsafe_paths(tmp_path):
     package_path.write_text(json.dumps(package), encoding="utf-8")
     loader = GitmootDataLoader(str(package_path), str(artifact_root))
 
-    with pytest.raises(ValueError, match="not safe"):
-        loader.setup({})
+    loader.setup({})  # no longer raises
+
+    segment = safe_item_path_segment("../escape")
+    assert "/" not in segment and "\\" not in segment
+    assert ".." not in segment.split("-")[0]  # traversal neutralized

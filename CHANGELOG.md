@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.4.2
+
+- **Fix: sanitize Mode A PR-ref item ids instead of rejecting them.**
+  `safe_item_path_segment` raised `ValueError` on item ids containing `/`
+  (e.g. a gitmoot PR ref `owner/repo#5`, which Mode A trace harvesting (#465)
+  uses as the eval-item id), so optimizing a package built from real merged/
+  blocked PR outcomes crashed in the dataloader. Now already-safe ids pass
+  through unchanged and unsafe ids are deterministically sanitized into a safe
+  path segment (slug + short stable hash). Found by a live end-to-end Mode A
+  optimization run.
+
 ## v0.4.1
 
 - **Fix: accept the `kimi` runtime in template `runtime_compatibility`.** gitmoot

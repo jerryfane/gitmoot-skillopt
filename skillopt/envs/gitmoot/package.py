@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -119,10 +121,22 @@ def json_safe_metadata(value: Any) -> dict[str, Any]:
 
 
 def safe_item_path_segment(item_id: str) -> str:
-    """Return an item id that is safe to use as one filesystem path segment."""
+    """Return an item id that is safe to use as one filesystem path segment.
+
+    Already-safe ids are returned unchanged. Ids that are not safe as a single
+    path segment — e.g. a gitmoot PR ref like ``owner/repo#5`` that Mode A trace
+    harvesting (#465) uses as the item id — are deterministically sanitized into a
+    safe segment (slug + short stable hash) rather than rejected, so feedback
+    harvested from real PR outcomes can be optimized like any other source.
+    """
     value = str(item_id).strip()
     if not value:
         raise ValueError("Gitmoot item id is required")
-    if value in {".", ".."} or "/" in value or "\\" in value:
-        raise ValueError(f"Gitmoot item id {item_id!r} is not safe for filesystem output")
-    return value
+    if value not in {".", ".."} and "/" not in value and "\\" not in value:
+        return value
+    # Unsafe as a path segment: sanitize deterministically. Replace any run of
+    # non-portable characters with '_' and append a short hash of the ORIGINAL id
+    # so two distinct ids never collide into the same directory.
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._-") or "item"
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
+    return f"{slug}-{digest}"
