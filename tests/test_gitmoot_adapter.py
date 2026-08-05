@@ -3963,3 +3963,31 @@ def _valid_vue_bundle_response(
             "files": [{"path": path, "content": content} for path, content in files],
         }
     )
+
+
+def test_result_carries_prediction_id_so_reflect_finds_pr_ref_trajectories(tmp_path):
+    """A Mode A auto-trace item id ("owner/repo#NN") is not filesystem-safe: the
+    rollout writes predictions/ under safe_item_path_segment(id), so the result
+    dict must carry that segment as the trusted top-level prediction_id or the
+    reflect stage falls back to the raw id, finds no conversation.json, silently
+    skips the analyst, and the optimizer can never produce a patch (#538)."""
+    from skillopt.envs.gitmoot.package import safe_item_path_segment
+
+    item = {
+        "id": "jerryfane/noted#11",
+        "prompt": "Prompt",
+        "metadata": {"expected_hard": True},
+        "evaluator_config": {"mode": "fixture"},
+    }
+
+    result = process_one(item=item, skill_content="skill", out_root=str(tmp_path))
+
+    expected_segment = safe_item_path_segment("jerryfane/noted#11")
+    assert result["prediction_id"] == expected_segment
+    conv_path = tmp_path / "predictions" / expected_segment / "conversation.json"
+    assert conv_path.is_file()
+
+    # The reflect stage must resolve the trajectory from the result dict alone.
+    text = fmt_minibatch_trajectories([result], str(tmp_path / "predictions"))
+    assert text.strip()
+    assert "jerryfane/noted#11" in text

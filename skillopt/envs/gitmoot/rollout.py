@@ -197,6 +197,14 @@ def process_one(
             )
     result = {
         "id": item_id,
+        # The sanitized on-disk predictions/ segment. The reflect stage
+        # (skillopt.gradient.reflect.fmt_minibatch_trajectories) prefers this
+        # trusted top-level key over the raw id when locating conversation.json;
+        # without it, any item id that is not filesystem-safe (e.g. a Mode A
+        # auto-trace PR ref like "owner/repo#11") never resolves its trajectory,
+        # the analyst is silently skipped, and the optimizer can never turn the
+        # failure hints into a patch (#538 live-run finding).
+        "prediction_id": prediction_id,
         "hard": score.get("hard"),
         "soft": score.get("soft"),
         "response": response,
